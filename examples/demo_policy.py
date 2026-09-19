@@ -32,9 +32,6 @@ def main() -> int:
     cfg = TaskConfig(level=a.level, observation=a.observation, seed=1)
     task = NavigationTask(sim, cfg, overlay=True)
     policy = make_policy(a.policy)
-    scaled = a.policy not in ("waypoint", "random")
-    if scaled:
-        from envdr3d_learn.train_ppo import OBS_SCALE
     step_dt = cfg.action_repeat * 0.004
     for ep in range(a.episodes):
         obs, info = task.reset(seed=a.seed + ep)
@@ -42,7 +39,7 @@ def main() -> int:
         done = False
         while not done:
             t0 = time.time()
-            act = policy(obs / OBS_SCALE) if scaled else policy(obs)
+            act = policy(obs)
             obs, r, term, trunc, info = task.step(act)
             done = term or trunc
             if a.pace > 0:

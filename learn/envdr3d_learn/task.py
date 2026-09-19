@@ -127,6 +127,7 @@ class NavigationTask:
         self._rng = random.Random(0)
         self._episode_idx = -1
         self._loaded = False
+        self.limits = (4.0, 2.0)
         self.obs_dim = 12
         self.act_dim = 3
         self._reset_state()
@@ -170,7 +171,17 @@ class NavigationTask:
         vx, vy, vz = (float(v) * self.cfg.max_speed for v in a)
         if self.cfg.hold_altitude:
             vz = float(np.clip(1.0 * (self.target[2] - self.prev_pos[2]), -1.0, 1.0))
+        # Never emit an action the simulator would reject: a saturated diagonal command
+        # (3 m/s on two axes = 4.24 m/s) exceeds the agent's 4 m/s limit, the simulator
+        # correctly refuses it, and the drone keeps its latched hold -> a silently stuck
+        # episode. Clamp to the advertised limits instead (and fail loudly if rejected anyway).
+        h = math.hypot(vx, vy)
+        if h > self.limits[0]:
+            vx, vy = vx * self.limits[0] / h, vy * self.limits[0] / h
+        vz = max(-self.limits[1], min(self.limits[1], vz))
         res = self.sim.step(agent=AGENT, action=self.sim.velocity(vx, vy, vz, frame="world"), steps=self.cfg.action_repeat)
+        if res.rejected_actions:
+            raise RuntimeError(f"simulator rejected the action: {res.rejected_actions}")
         self.steps += 1
         obs, st = self._observe(res.observations.get(AGENT))
         pos = self._pos(st)
@@ -244,6 +255,8 @@ class NavigationTask:
             raise RuntimeError(f"scenario {self.scenario_name} does not expose privileged state")
         if self.cfg.observation != "state" and "gps" not in comps:
             raise RuntimeError(f"scenario {self.scenario_name} lacks gps; navigation/vision modes need it")
+        lim = self.sim.agent(AGENT)["action_space"]["limits"]
+        self.limits = (float(lim["max_speed_xy"]), float(lim["max_speed_z"]))
         self._loaded = True
 
     def _reset_state(self) -> None:

@@ -80,3 +80,17 @@ def test_trajectory_recorder_writes_aligned_dataset(sim, tmp_path):
     assert T == res.steps
     idx = [json.loads(l) for l in (tmp_path / "ds" / "index.jsonl").open()]
     assert idx[0]["success"] is True and idx[0]["file"] == files[0].name
+
+
+def test_saturated_actions_are_clamped_not_rejected(sim):
+    """Regression: a full diagonal action exceeded the agent's speed limit, the simulator rejected
+    it and the drone silently never moved (6/20 'failures' of the first learned policy)."""
+    task = NavigationTask(sim, TaskConfig(level="open", seed=1, max_steps=30), overlay=False)
+    obs, _ = task.reset(seed=21)
+    p0 = np.array(task.prev_pos)
+    for _ in range(10):
+        obs, r, term, trunc, info = task.step(np.array([1.0, 1.0, 0.0], np.float32))   # 4.24 m/s requested
+        if term or trunc:
+            break
+    moved = np.linalg.norm(np.array(info["position"]) - p0)
+    assert moved > 1.0, f"drone did not move after saturated actions ({moved:.2f} m)"

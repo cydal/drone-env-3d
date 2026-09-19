@@ -59,6 +59,8 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=256); ap.add_argument("--ent-coef", type=float, default=0.0)
     ap.add_argument("--gamma", type=float, default=0.98); ap.add_argument("--log-std-init", type=float, default=-0.5,
                     help="initial action noise: std = exp(x) in normalised action units (default 0.6 -> 1.8 m/s)")
+    ap.add_argument("--resume", default=None, help="continue training from this model.zip (new experiment dir)")
+    ap.add_argument("--lr-decay", action="store_true", help="linear learning-rate decay to 0 over the run")
     a = ap.parse_args()
 
     from stable_baselines3 import PPO
@@ -75,7 +77,7 @@ def main() -> int:
         "reward": cfg.reward.__dict__, "n_envs": a.n_envs, "total_steps": a.steps, "seed": a.seed,
         "ppo": {"learning_rate": a.lr, "n_steps": a.n_steps, "batch_size": a.batch_size, "ent_coef": a.ent_coef,
                 "gamma": a.gamma, "gae_lambda": 0.95, "policy": "MlpPolicy [64,64]", "log_std_init": a.log_std_init},
-        "evalset": EVALSET_FOR_LEVEL[a.level], "eval_every": a.eval_every,
+        "evalset": EVALSET_FOR_LEVEL[a.level], "eval_every": a.eval_every, "lr_decay": a.lr_decay,
     })
     print("experiment:", exp.dir)
 
@@ -83,9 +85,14 @@ def main() -> int:
     eval_sim_port = pool.ports[0]
     try:
         venv = SubprocVecEnv([make_env_fn(cfg, p, a.seed + i) for i, p in enumerate(pool.ports)], start_method="spawn")
-        model = PPO("MlpPolicy", venv, learning_rate=a.lr, n_steps=a.n_steps, batch_size=a.batch_size, ent_coef=a.ent_coef,
-                    gamma=a.gamma, gae_lambda=0.95, seed=a.seed, verbose=1, tensorboard_log=str(exp.path("tb")),
-                    policy_kwargs={"net_arch": [64, 64], "log_std_init": a.log_std_init}, device="cpu")
+        lr = (lambda progress: a.lr * progress) if a.lr_decay else a.lr
+        if a.resume:
+            model = PPO.load(a.resume, env=venv, device="cpu", learning_rate=lr, tensorboard_log=str(exp.path("tb")))
+            exp.meta["config"]["resumed_from"] = str(a.resume); exp.save()
+        else:
+            model = PPO("MlpPolicy", venv, learning_rate=lr, n_steps=a.n_steps, batch_size=a.batch_size, ent_coef=a.ent_coef,
+                        gamma=a.gamma, gae_lambda=0.95, seed=a.seed, verbose=1, tensorboard_log=str(exp.path("tb")),
+                        policy_kwargs={"net_arch": [64, 64], "log_std_init": a.log_std_init}, device="cpu")
         evalset = load_evalset(EVALSET_FOR_LEVEL[a.level]); evalset["name"] = EVALSET_FOR_LEVEL[a.level]
         evalset_small = {**evalset, "pairs": evalset["pairs"][:a.eval_episodes]}
 
@@ -122,7 +129,7 @@ def main() -> int:
             # final evaluation on the full fixed set, alongside the baselines for context
             from simclient import Simulation
             sim = Simulation(port=eval_pool.ports[0], timeout=120)
-            final = run_eval(ScaledPolicy(SB3Policy(self_model := model), name=name), cfg, evalset, sim=sim,
+            final = run_eval(ScaledPolicy(SB3Policy(model), name=name), cfg, evalset, sim=sim,
                              out_dir=exp.path("evals", "final"), record=True, verbose=True)
             exp.log_result("final_eval", {k: v for k, v in final.items() if k != "task_config"})
             for base in (WaypointPolicy(), RandomPolicy(a.seed)):

@@ -123,7 +123,8 @@ class StepResult:
 class Simulation:
     def __init__(self, host: str = "localhost", port: int = 8000, timeout: float = 60.0) -> None:
         self.base = f"http://{host}:{port}"
-        self._http = httpx.Client(base_url=self.base, timeout=timeout)
+        self._http = httpx.Client(base_url=self.base, timeout=timeout,
+                                  limits=httpx.Limits(max_connections=4, max_keepalive_connections=4, keepalive_expiry=120))
 
     # ---- lifecycle -------------------------------------------------------
     def status(self) -> dict[str, Any]:
@@ -289,14 +290,28 @@ class Simulation:
 
     # ---- helpers ----------------------------------------------------------
     def _get(self, path: str, params: dict | None = None):
-        r = self._http.get(path, params=params)
+        r = self._send("GET", path, params=params)
         self._raise(r)
         return r.json()
 
     def _post(self, path: str, body: dict | None = None):
-        r = self._http.post(path, json=body)
+        r = self._send("POST", path, json=body)
         self._raise(r)
         return r.json()
+
+    def _send(self, method: str, path: str, **kw) -> httpx.Response:
+        """Retry transient transport errors (e.g. macOS 'Can't assign requested address' when
+        ephemeral ports run out under ~200 req/s for long training runs)."""
+        delay = 0.2
+        for attempt in range(6):
+            try:
+                return self._http.request(method, path, **kw)
+            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
+                if attempt == 5:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 3.0)
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _raise(r: httpx.Response) -> None:

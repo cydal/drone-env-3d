@@ -56,19 +56,31 @@ class WaypointPolicy:
 
 class SB3Policy:
     """Frozen stable-baselines3 policy (deterministic actions). Loaded lazily so the rest of
-    the package works without torch installed."""
+    the package works without torch installed. Observation scaling used at training time is
+    read from the experiment.json next to (or above) the model file, so the same policy object
+    works for evaluation, demos and datasets without callers knowing about it."""
     name = "ppo"
 
-    def __init__(self, model, deterministic: bool = True, name: str = "ppo") -> None:
+    def __init__(self, model, deterministic: bool = True, name: str = "ppo", obs_scale=None) -> None:
         self.model, self.deterministic, self.name = model, deterministic, name
+        self.obs_scale = None if obs_scale is None else np.asarray(obs_scale, np.float32)
 
     @classmethod
     def load(cls, path: str | Path, deterministic: bool = True) -> "SB3Policy":
+        import json
         from stable_baselines3 import PPO
-        return cls(PPO.load(str(path), device="cpu"), deterministic, name=Path(path).stem)
+        path = Path(path)
+        scale = None
+        for parent in (path.parent, path.parent.parent):
+            meta = parent / "experiment.json"
+            if meta.exists():
+                scale = json.loads(meta.read_text()).get("config", {}).get("obs_scale")
+                break
+        return cls(PPO.load(str(path), device="cpu"), deterministic, name=path.stem, obs_scale=scale)
 
     def __call__(self, obs: np.ndarray) -> np.ndarray:
-        action, _ = self.model.predict(obs, deterministic=self.deterministic)
+        x = obs / self.obs_scale if self.obs_scale is not None else obs
+        action, _ = self.model.predict(x, deterministic=self.deterministic)
         return np.asarray(action, np.float32)
 
     def reset(self) -> None:
