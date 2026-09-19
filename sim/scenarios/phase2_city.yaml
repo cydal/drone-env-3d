@@ -1,0 +1,59 @@
+name: phase2_city
+description: >
+  Three quadcopters with different observation profiles, a moving target
+  circling above the plaza and a ground vehicle patrolling a straight road.
+world:
+  name: test_city
+  file: test_city.sdf
+  bounds: {x: [-150, 150], y: [-150, 150], z: [-1, 80]}
+agents:
+  - id: drone_01
+    type: drone
+    template: quadcopter
+    spawn: {position: {x: 0.0, y: 1.5, z: 0.2}}
+    observation: state
+    control: waypoint
+    params: {color: "0.95 0.45 0.10 1"}
+    camera: {width: 320, height: 240, hfov: 1.396, update_rate: 15, depth: true}
+  - id: drone_02
+    type: drone
+    template: quadcopter
+    spawn: {position: {x: 0.0, y: -1.5, z: 0.2}}
+    observation: navigation
+    control: waypoint
+    params: {color: "0.15 0.65 0.95 1"}
+  - id: drone_03
+    type: drone
+    template: quadcopter
+    spawn: {position: {x: -1.5, y: 0.0, z: 0.2}}
+    observation: shared
+    control: velocity
+    params: {color: "0.35 0.85 0.35 1"}
+entities:
+  - id: target_01
+    type: target
+    template: target
+    spawn: {position: {x: 20.0, y: -10.0, z: 8.0}}
+    trajectory: {type: circle, center: {x: 20.0, y: -10.0, z: 8.0}, radius: 8.0, speed: 2.0}
+    params: {radius: 0.5, color: "1.0 0.2 0.2 1"}
+  - id: vehicle_01
+    type: vehicle
+    template: vehicle
+    spawn: {position: {x: -30.0, y: -8.0, z: 0.75}}
+    trajectory: {type: line, start: {x: -30.0, y: -8.0, z: 0.75}, end: {x: 30.0, y: -8.0, z: 0.75}, speed: 4.0, loop: true}
+observation_profiles:
+  state_plus_gps: [state, gps]
+environment:
+  wind: {x: 0.0, y: 0.0, z: 0.0}
+simulation:
+  step_size: 0.004
+  real_time_factor: 1.0
+  seed: 18372
+  start_paused: false
+  mode: realtime
+episode:
+  max_sim_time: null
+  terminate_on: []
+logging:
+  enabled: true
+  realtime_hz: 10

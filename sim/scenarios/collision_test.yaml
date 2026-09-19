@@ -1,0 +1,22 @@
+name: collision_test
+description: One drone spawned next to the tower; used by the collision-event test.
+world:
+  name: test_city
+  file: test_city.sdf
+  bounds: {x: [-100, 100], y: [-100, 100], z: [-1, 60]}
+agents:
+  - id: drone_01
+    type: drone
+    template: quadcopter
+    spawn: {position: {x: 12.0, y: 10.0, z: 0.2}}
+    observation: state
+    control: waypoint
+simulation:
+  step_size: 0.004
+  seed: 7
+  start_paused: true
+  mode: stepped
+episode:
+  terminate_on: []
+logging:
+  enabled: true

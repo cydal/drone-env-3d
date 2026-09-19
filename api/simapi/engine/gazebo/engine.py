@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 
 LANDING_SURFACES = ("ground", "pad_")       # contact with these = landing/takeoff, not collision
 CONTACT_COOLDOWN_S = 0.5                    # sim seconds before the same pair re-emits a collision
-GROUND_CONTACT_TIMEOUT_S = 0.15             # sim seconds without ground contact -> airborne
+GROUND_CONTACT_TIMEOUT_S = 0.35             # sim seconds without ground contact -> airborne
 
 
 def _t(msg_time) -> float:
@@ -374,8 +374,11 @@ class GazeboEngine(SimulationEngine):
         def cb(msg):
             events: list[EngineEvent] = []
             with self._lock:
+                # Contacts carries one stamp for the whole batch; per-contact headers are
+                # usually absent and the stats clock is too coarse (10 Hz) to use here.
+                t_batch = _t(msg.header.stamp) if msg.HasField("header") else self.sim_time()
                 for c in msg.contact:
-                    t = _t(c.header.stamp) if c.HasField("header") else self.sim_time()
+                    t = _t(c.header.stamp) if c.HasField("header") and c.header.stamp.sec + c.header.stamp.nsec else t_batch
                     n1, n2 = c.collision1.name, c.collision2.name
                     other_coll = n2 if n1.startswith(io.id + "::") else n1
                     other = other_coll.split("::")[0]
