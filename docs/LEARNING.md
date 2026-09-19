@@ -90,3 +90,30 @@ Artefacts:
 
 Do not advance a level because the model *trains*; advance when its evaluation on
 the fixed set meets the level's criterion (open: ≥ 90 % success, 0 collisions).
+
+
+## Lessons from the first learned agent (failure analysis in practice)
+
+Both problems below were found with `inspect_episode` on evaluation traces, not by
+staring at reward curves — which is the point of brief 3 §13/§24.
+
+1. **Stall 8–9 m from the target (run 1).** The policy learned the coarse heading and
+   flew fast, but its fine approach was poor. Cause: the progress reward sums to
+   `d0 − dT` regardless of speed or final closeness, and the +10 reach bonus was rarely
+   found under exploration noise of std ≈ 0.8 (≈ 2.4 m/s). Fix: dense
+   `distance_penalty·d` per step, `log_std_init = −0.5`, γ = 0.98. Training return
+   then rose monotonically.
+
+2. **Episodes where the drone never moved (run 2, 6/20 evaluation "failures").** The
+   drone hovered at its start for 20 s with velocity exactly 0.00 while the policy
+   commanded a saturated diagonal `[1, 1, ·]` = 4.24 m/s. The agent's advertised limit
+   is 4 m/s, so the simulator rejected the action (correctly, 422) and the task
+   ignored `rejected_actions`; the drone kept its latched hold. Environment problem
+   (in the task layer), not a learning problem: the engineered baseline never
+   saturates and scored 20/20 through the same path. Fix: the task clamps to the
+   agent's limits and raises on any rejection. The polluted rollouts also explain the
+   noisy, non-monotonic evaluation curve of run 2.
+
+General rule that fell out of this: **when a learned policy fails, first replay the
+trace and compare with the engineered baseline on the same fixed pair.** Identical
+outcomes point at the environment/task; divergent ones at the policy.

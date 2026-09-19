@@ -88,9 +88,10 @@ def test_saturated_actions_are_clamped_not_rejected(sim):
     task = NavigationTask(sim, TaskConfig(level="open", seed=1, max_steps=30), overlay=False)
     obs, _ = task.reset(seed=21)
     p0 = np.array(task.prev_pos)
-    for _ in range(10):
+    for _ in range(20):                                                                 # 2 s of sim
         obs, r, term, trunc, info = task.step(np.array([1.0, 1.0, 0.0], np.float32))   # 4.24 m/s requested
         if term or trunc:
             break
     moved = np.linalg.norm(np.array(info["position"]) - p0)
-    assert moved > 1.0, f"drone did not move after saturated actions ({moved:.2f} m)"
+    # the controller's 2 m/s^2 acceleration limit gives ~3 m in 2 s; the bug gave exactly 0.00
+    assert moved > 1.5, f"drone did not move after saturated actions ({moved:.2f} m)"
