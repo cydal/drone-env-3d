@@ -38,8 +38,23 @@ function makeLabel(text: string, color: string): THREE.Sprite {
   ctx.fillStyle = "rgba(11,14,19,0.75)"; ctx.fillRect(0, 8, ctx.measureText(text).width + 24, 48);
   ctx.fillStyle = color; ctx.fillText(text, 12, 42);
   const tex = new THREE.CanvasTexture(c);
-  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
-  s.scale.set(2.4, 0.6, 1); s.center.set(0, 0.5);
+  // sizeAttenuation: false keeps the label (and the dot below) a constant, readable size on
+  // screen no matter how far the agent is -- true-scale drones (~0.2 m) would otherwise
+  // shrink to sub-pixel specks a few tens of metres out.
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, sizeAttenuation: false }));
+  s.scale.set(0.09, 0.0225, 1); s.center.set(0, 0.5);
+  return s;
+}
+
+function makeDot(color: THREE.Color): THREE.Sprite {
+  const c = document.createElement("canvas"); c.width = 32; c.height = 32;
+  const ctx = c.getContext("2d")!;
+  ctx.beginPath(); ctx.arc(16, 16, 13, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(${color.r * 255}, ${color.g * 255}, ${color.b * 255}, 1)`; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, sizeAttenuation: false }));
+  s.scale.set(0.018, 0.018, 1);
   return s;
 }
 
@@ -51,6 +66,7 @@ export class WorldScene {
   private trails = new Map<string, Trail>();
   private arrows = new Map<string, THREE.ArrowHelper>();
   private labels = new Map<string, THREE.Sprite>();
+  private markers = new Map<string, THREE.Sprite>();
   private axes = new Map<string, THREE.AxesHelper>();
   private frustums = new Map<string, THREE.LineSegments>();
   private collisionMarks: { m: THREE.Mesh; t: number }[] = [];
@@ -80,9 +96,10 @@ export class WorldScene {
     for (const t of this.trails.values()) this.scene.remove(t.line);
     for (const a of this.arrows.values()) this.scene.remove(a);
     for (const l of this.labels.values()) this.scene.remove(l);
+    for (const d of this.markers.values()) this.scene.remove(d);
     for (const f of this.frustums.values()) this.scene.remove(f);
     for (const c of this.collisionGeoms) this.scene.remove(c);
-    this.models.clear(); this.meta.clear(); this.trails.clear(); this.arrows.clear(); this.labels.clear(); this.axes.clear(); this.frustums.clear(); this.collisionGeoms = [];
+    this.models.clear(); this.meta.clear(); this.trails.clear(); this.arrows.clear(); this.labels.clear(); this.markers.clear(); this.axes.clear(); this.frustums.clear(); this.collisionGeoms = [];
     const info = new Map(agents.map(a => [a.agent_id, a]));
     for (const m of desc.models) this.addModel(m, info.get(m.entity_id));
     if (this.boundsBox) { this.scene.remove(this.boundsBox); this.boundsBox = null; }
@@ -125,7 +142,8 @@ export class WorldScene {
       const color = mainColor ?? new THREE.Color(0xff8a2a);
       this.agentColors.set(m.entity_id, color);
       const trail = new Trail(color); this.trails.set(m.entity_id, trail); this.scene.add(trail.line);
-      const label = makeLabel(m.entity_id, "#" + color.getHexString()); label.position.set(0, 0, 0.6);
+      const dot = makeDot(color); dot.position.set(0, 0, 0.6); group.add(dot); this.markers.set(m.entity_id, dot);
+      const label = makeLabel(m.entity_id, "#" + color.getHexString()); label.position.set(0, 0, 0.85);
       group.add(label); this.labels.set(m.entity_id, label);
       if (m.is_agent) {
         const arrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1, 0x2ab1ff, 0.3, 0.15);

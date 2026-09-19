@@ -209,6 +209,12 @@ health strip (`/metrics`) and **manual keyboard flight** that goes through the
 same public action API as any Python controller (W/S/A/D, R/F, Q/E, X hold,
 Z arm/disarm; tick *Manual control* on a selected agent).
 
+The camera auto-frames the agent cluster on load/reset instead of a wide,
+mostly-empty establishing shot, agent labels/markers keep a constant on-screen
+size regardless of distance so a drone never shrinks to an invisible speck,
+and a **Fit view** button recentres on all agents at any time (useful after
+one flies out of frame — there is no off-screen indicator yet, see Known limits).
+
 ### Example controllers (`examples/`)
 
 ```bash
@@ -241,8 +247,9 @@ Gazebo → API → external Python controller → drone moves → browser sees i
   telemetry panel (pose, world velocity, attitude, IMU), orbit/follow/top cameras.
 * Every run writes `runs/<stamp>_<scenario>/{scenario.yaml,world.sdf,gz-server.log}`.
 
-Not yet: camera/depth image transport (headless rendering is Linux/EGL only; see
-`docs/SENSORS.md`), NavSat in observations, recording/replay, the nicer city.
+Not yet: recording/replay beyond the per-episode JSONL log, the nicer city, and an
+on-screen indicator for agents that fly outside the current view (mitigated by the
+Fit view button, see the browser section above).
 
 ## Tests
 

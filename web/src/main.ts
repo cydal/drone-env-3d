@@ -114,6 +114,7 @@ function quatToEuler(x: number, y: number, z: number, w: number) {
 }
 
 // ---- scene loading -----------------------------------------------------------
+let framedOnce = false;
 async function loadScene() {
   try {
     const [desc, ag] = await Promise.all([api.scene(), api.agents()]);
@@ -124,7 +125,29 @@ async function loadScene() {
     else select(selected);
     const evs = await api.events(0); $("#event-list").innerHTML = ""; lastEventSeq = 0;
     for (const e of evs) addEvent(e);
+    if (!framedOnce) { framedOnce = true; frameAgents(); }
   } catch (e) { console.warn("scene not available yet", e); }
+}
+
+/** Point the orbit camera at the current agents (and any moving entities) with margin,
+ * so the interesting part of the world is visible instead of a wide, empty establishing
+ * shot. Runs once per scene load/reset; the "Fit view" button re-runs it on demand
+ * (e.g. after a drone flies out of frame, which has no other on-screen indicator yet). */
+function frameAgents() {
+  const box = new THREE.Box3();
+  let any = false;
+  for (const m of world.meta.values()) {
+    if (m.entity_id === "ground" || m.is_static) continue;
+    const g = world.models.get(m.entity_id);
+    if (g) { box.expandByPoint(g.position); any = true; }
+  }
+  if (!any) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size = Math.max(box.getSize(new THREE.Vector3()).length(), 6);
+  const dist = size * 1.4 + 4;
+  controls.target.copy(center);
+  camera.position.set(center.x - dist * 0.6, center.y - dist * 0.6, center.z + dist * 0.45);
+  camera.up.set(0, 0, 1);
 }
 async function refreshScenarios() {
   const sel = $("#scenario-select") as HTMLSelectElement;
@@ -167,7 +190,7 @@ const tele = new Telemetry((m: WsMessage) => {
     case "state": applyStatus({ sim_time: m.sim_time, paused: m.paused, mode: m.mode as any, real_time_factor: m.rtf, iterations: m.iterations }); world.updatePoses(m.poses, m.vel); break;
     case "event": addEvent(m); break;
     case "scenario_loaded": case "scene_changed": loadScene(); refreshScenarios(); api.status().then(applyStatus); break;
-    case "reset": world.clearTrails(); loadScene(); api.status().then(applyStatus); break;
+    case "reset": world.clearTrails(); framedOnce = false; loadScene(); api.status().then(applyStatus); break;
     case "ack": if (m.status) applyStatus(m.status); break;
     case "error": toast(m.message); break;
   }
@@ -194,6 +217,11 @@ document.querySelectorAll<HTMLButtonElement>("#cam-modes button").forEach(b => (
   camera.up.set(0, 0, 1);
   if (camMode === "top") camera.up.set(0, 1, 0);
 }));
+$("#btn-fit").onclick = () => {
+  camMode = "orbit";
+  document.querySelectorAll<HTMLButtonElement>("#cam-modes button[data-cam]").forEach(x => x.classList.toggle("active", x.dataset.cam === "orbit"));
+  controls.enabled = true; frameAgents();
+};
 
 // keyboard: space = play/pause (realtime) or step (stepped); manual flight keys when enabled
 const keys = new Set<string>();
