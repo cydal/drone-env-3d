@@ -126,6 +126,13 @@ def create_app(engine_factory=None) -> FastAPI:
         except Exception as e:
             raise _err(e)
 
+    @app.post("/simulation/speed", response_model=SimStatus)
+    async def speed(body: dict):
+        try:
+            return await service.set_speed(float(body.get("real_time_factor", 1.0)))
+        except Exception as e:
+            raise _err(e)
+
     @app.post("/simulation/mode", response_model=SimStatus)
     async def mode(req: ModeRequest):
         try:
@@ -184,7 +191,7 @@ def create_app(engine_factory=None) -> FastAPI:
             cam = CameraSpec.model_validate(req.camera) if req.camera is not None else None
             mounts = [SensorMount.model_validate(m) for m in (req.sensors or [])]
             await service.spawn(req.entity_id, req.template, req.pose, req.params, observation=req.observation, camera=cam,
-                                drone_type=req.drone_type, sensors=mounts, trajectory=req.trajectory)
+                                drone_type=req.drone_type, sensors=mounts, trajectory=req.trajectory, control=req.control)
         except Exception as e:
             raise _err(e)
         return {"spawned": req.entity_id}

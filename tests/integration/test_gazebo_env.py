@@ -35,7 +35,7 @@ def test_lifecycle(sim):
 
 def test_agent_spawn_observe_act_remove(sim):
     sim.reset(scenario="collision_test", seed=7, mode="stepped")
-    sim.spawn("drone_x", position=(0, 0, 0.2), observation="navigation")
+    sim.spawn("drone_x", position=(0, 0, 0.2), observation="navigation", control="velocity")
     info = sim.agent("drone_x")
     assert info["observation_space"]["profile"] == "navigation" and "waypoint" not in info["action_space"]["types"]
     sim.step(steps=50)  # let it settle so sensors publish

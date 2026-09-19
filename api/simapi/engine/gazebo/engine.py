@@ -125,6 +125,7 @@ class GazeboEngine(SimulationEngine):
         self._want_paused = True
         self._last_pose_time = 0.0
         self._derived_iterations = 0
+        self._initial_models: set[str] = set()
         self._stats_wall = 0.0            # arrival time of the last stats message
         self._reset_wall = 0.0            # time of the last observed rewind; older stats are stale
 
@@ -146,7 +147,8 @@ class GazeboEngine(SimulationEngine):
 
         base = (config.WORLDS_DIR / scenario.world.file).read_text()
         world_file = self.run_dir / "world.sdf"
-        world_file.write_text(sdfgen.build_world_sdf(base, scenario))
+        world_sdf = sdfgen.build_world_sdf(base, scenario)
+        world_file.write_text(world_sdf)
 
         start_paused = scenario.simulation.start_paused or scenario.simulation.mode == "stepped"
         self._want_paused = start_paused
@@ -164,6 +166,15 @@ class GazeboEngine(SimulationEngine):
             self._kinds = {a.id: a.type for a in scenario.agents}
             self._kinds.update({e.id: e.type for e in scenario.entities})
         await self._refresh_scene()
+        # The scenario's true initial model set comes from the generated world file itself (all
+        # <model name="..."> entries incl. agents/entities), never from a scene snapshot that may
+        # still be incomplete right after load. Purging a legitimate model would be catastrophic
+        # (deleting a grounded drone crashes dartsim).
+        import re
+        with self._lock:
+            self._initial_models = set(re.findall(r'<model name="([^"]+)"', world_sdf))
+            self._initial_models |= {a.id for a in scenario.agents} | {e.id for e in scenario.entities}
+            self._initial_models |= set(self._model_ids.values())
         for a in scenario.agents:
             self._attach_agent(a.id, a.camera, a.camera_mounts)
         log.info("world '%s' ready (seed=%s, rendering=%s), agents=%s",
@@ -237,6 +248,51 @@ class GazeboEngine(SimulationEngine):
             for a in self._agents.values():
                 a.reset_transients()
             self._last_pose_time = 0.0
+        await self._purge_resurrected()
+
+    async def _purge_resurrected(self) -> None:
+        """gz-sim's rewind re-creates entities that were spawned after load (they live in its
+        initial-state snapshot), so runtime-spawned models reappear at their spawn pose even
+        after we removed them. Delete them again right after the rewind: they are freshly
+        created and have no cached contacts, so the delete-in-contact crash cannot trigger."""
+        # The re-creation lands a little after the rewind is observable in world stats, so poll
+        # the scene until it is stable (two consecutive identical model sets) and purge extras
+        # as they show up; give up after ~1.5 s (nothing to purge).
+        if not self._initial_models:
+            return
+        g = self.tp.g
+        loop = asyncio.get_running_loop()
+        purged: list[str] = []
+        quiet = 0
+        prev: set[str] | None = None
+        for _ in range(15):
+            await self._refresh_scene()
+            with self._lock:
+                names = set(self._model_ids.values())
+                extra = [n for n in names if n not in self._initial_models]
+            if extra:
+                for name in extra:
+                    if name in self._agents:
+                        self._detach_agent(name)
+                    req = g["Entity"]()
+                    req.name = name
+                    req.type = g["Entity"].MODEL
+                    await loop.run_in_executor(None, lambda r=req: self._request_retry(f"/world/{self.world}/remove", r, g["Boolean"]))
+                for name in extra:
+                    await self._wait_for_model(name, present=False)
+                    with self._lock:                       # after the model is gone (see remove())
+                        self._poses.pop(name, None)
+                        self._kinds.pop(name, None)
+                purged += extra
+                quiet = 0; prev = None
+                continue
+            quiet = quiet + 1 if prev == names else 1
+            prev = names
+            if quiet >= 2:
+                break
+            await asyncio.sleep(0.1)
+        if purged:
+            log.info("purged %d resurrected runtime entities after rewind: %s", len(purged), purged)
 
     def _reset_blocking(self) -> None:
         with self._lock:
@@ -462,8 +518,11 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             self._scene_msg = scene
             self._model_ids = {m.id: m.name for m in scene.model}
+            live = set(self._model_ids.values())
             for m in scene.model:
                 self._poses.setdefault(m.name, _pose_from_msg(m.pose))
+            for stale in [n for n in self._poses if n not in live]:
+                self._poses.pop(stale, None)
 
     async def _wait_for_model(self, entity_id: str, *, present: bool, timeout: float = 5.0) -> None:
         """UserCommands are executed on the server's next update; poll the scene until
@@ -510,10 +569,9 @@ class GazeboEngine(SimulationEngine):
         k = self._kinds.get(name)
         if k:
             return k
-        if name == "ground":
-            return "static"
         if name not in self._dynamic:
-            return "building" if any(s in name for s in ("tower", "block", "deck")) else "obstacle"
+            cat = category_of(name)
+            return {"building": "building", "terrain": "static", "infrastructure": "static"}.get(cat, "obstacle")
         return "dynamic"
 
     async def scene(self) -> SceneDesc:
@@ -533,13 +591,26 @@ class GazeboEngine(SimulationEngine):
             links.append(LinkDesc(name=l.name, pose=_pose_from_msg(l.pose) if l.HasField("pose") else Pose(),
                                   visuals=visuals))
         return ModelDesc(entity_id=m.name, kind=self._kind(m.name), is_agent=m.name in self._agents,
+                         category=self._category(m.name),
                          pose=self._poses.get(m.name, _pose_from_msg(m.pose)), links=links,
                          is_static=m.name not in self._dynamic)
 
+    def _category(self, name: str) -> str:
+        if name in self._agents:
+            return "drone"
+        k = self._kinds.get(name)
+        if k in ("vehicle", "target"):
+            return k
+        if k == "dynamic" or name in self._dynamic:
+            return "dynamic"
+        return category_of(name)
+
     def list_entities(self) -> list[EntityInfo]:
         with self._lock:
-            return [EntityInfo(entity_id=n, kind=self._kind(n), is_agent=n in self._agents, pose=p)
-                    for n, p in self._poses.items()]
+            live = set(self._model_ids.values())
+            return [EntityInfo(entity_id=n, kind=self._kind(n), is_agent=n in self._agents, pose=p,
+                               category=self._category(n))
+                    for n, p in self._poses.items() if n in live]
 
     def agent_ids(self) -> list[str]:
         with self._lock:
@@ -684,10 +755,11 @@ class GazeboEngine(SimulationEngine):
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/remove", req, g["Boolean"]))
         if entity_id in self._agents:
             self._detach_agent(entity_id)
+        await self._wait_for_model(entity_id, present=False)
+        # Only now: pose messages for the not-yet-deleted model would otherwise re-insert it.
         with self._lock:
             self._poses.pop(entity_id, None)
             self._kinds.pop(entity_id, None)
-        await self._wait_for_model(entity_id, present=False)
 
     def set_pose(self, entity_id: str, pose: Pose) -> None:
         g = self.tp.g
@@ -699,6 +771,14 @@ class GazeboEngine(SimulationEngine):
             self.tp.request(f"/world/{self.world}/set_pose", msg, g["Boolean"], 2000)
         except TimeoutError:
             log.warning("set_pose timed out for %s", entity_id)
+
+    def set_speed(self, real_time_factor: float) -> None:
+        """Target real-time factor for free-running mode (0 = as fast as possible)."""
+        from gz.msgs.physics_pb2 import Physics
+        msg = Physics()
+        msg.real_time_factor = float(real_time_factor)
+        msg.max_step_size = self.scenario.simulation.step_size if self.scenario else 0.004
+        self._request_retry(f"/world/{self.world}/set_physics", msg, self.tp.g["Boolean"], attempts=2)
 
     # ------------------------------------------------------------------ actions
     def send_velocity(self, agent_id: str, action: VelocityAction) -> None:
@@ -725,6 +805,24 @@ class GazeboEngine(SimulationEngine):
 
 
 # ---------------------------------------------------------------------- helpers
+_BUILDING_WORDS = ("building", "warehouse", "service_bay", "tower", "chimney", "tank", "block", "deck")
+_TERRAIN_WORDS = ("ground", "hill", "ramp", "embankment", "terrain")
+_INFRA_WORDS = ("pad", "road", "street", "apron", "bridge", "platform", "mast", "pole", "fence", "wall", "marking",
+                "zone", "plaza", "grid", "track", "lamp", "light")
+
+
+def category_of(name: str) -> str:
+    """Static-entity category from its name (assets follow these naming conventions)."""
+    n = name.lower()
+    if any(w in n for w in _TERRAIN_WORDS):
+        return "terrain"
+    if any(w in n for w in _BUILDING_WORDS):
+        return "building"
+    if any(w in n for w in _INFRA_WORDS):
+        return "infrastructure"
+    return "obstacle"
+
+
 def _color(v) -> list[float] | None:
     if not v.HasField("material"):
         return None

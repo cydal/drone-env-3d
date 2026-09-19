@@ -205,5 +205,11 @@ action sequence, so restore = reset + re-apply. Cost: about 8× faster than real
 recorded iteration, which is approximate because realtime actions arrive between
 iterations; the returned divergence tells you how approximate.
 
+A restore (or replay) starts a **new episode** whose recording begins with the replayed
+prefix, so every episode's recording is self-contained and reproduces that episode from
+a bare reset. Recordings also log `spawn` / `remove` / `teleport` operations, so runtime
+entities are re-created on replay. Note that `reset` removes runtime-spawned entities
+(and purges the copies gz-sim's rewind resurrects); scenario entities are never touched.
+
 Client: `sim.world_state()`, `sim.recording_start()/stop()`, `sim.recording_rows()`,
 `sim.iter_rows()`, `sim.replay(id)`, `sim.snapshot(name)`, `sim.restore(id)`.

@@ -3,46 +3,60 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>env-dr3d · simulation</title>
+  <title>env-dr3d · autonomous simulation world</title>
   <link rel="stylesheet" href="/src/style.css" />
 </head>
-<body>
+<body class="mode-operations">
   <div id="app">
     <header id="topbar">
       <div class="brand">ENV<span>·</span>DR3D</div>
-      <div id="scenario-box">
-        <select id="scenario-select"></select>
+      <div class="group">
+        <select id="scenario-select" title="Scenario"></select>
         <button id="btn-load" title="Load scenario (new episode)">Load</button>
       </div>
-      <div id="sim-controls">
+      <div class="group seg" id="view-seg" title="Presentation mode">
+        <button data-view="operations" class="active" title="Operations: clean view">Ops</button><button data-view="development" title="Development: overlays, hierarchy, status">Dev</button><button data-view="replay" title="Replay: recordings, snapshots, events">Replay</button>
+      </div>
+      <div class="group" id="transport">
         <div class="seg" id="mode-seg" title="Realtime: free-running · Stepped: advances only on Step">
           <button data-mode="realtime" class="active">Realtime</button><button data-mode="stepped">Stepped</button>
         </div>
-        <button id="btn-play" title="Play/Pause (space)">▶</button>
-        <button id="btn-step" title="Step N iterations">⏭ <span id="step-n">25</span></button>
+        <button id="btn-play" title="Play / Pause (space)">▶</button>
+        <button id="btn-step" title="Step N iterations (space in stepped mode)">⏭</button>
         <input id="step-input" type="number" min="1" max="10000" value="25" title="iterations per step" />
         <button id="btn-reset" title="Reset episode (same seed unless set)">↺</button>
-        <input id="seed-input" type="number" placeholder="seed" title="seed for next reset (blank = keep)" />
+        <input id="seed-input" type="number" placeholder="seed" title="seed for the next reset (blank = keep)" />
+        <select id="speed-select" title="Speed (realtime mode)">
+          <option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option>
+          <option value="2">2×</option><option value="4">4×</option><option value="0">Max</option>
+        </select>
       </div>
       <div id="clock">
-        <span class="stat"><label>t</label><span id="sim-time">0.000</span>s</span>
+        <div class="simclock"><label>SIM</label><span id="sim-time">00:00.00</span></div>
         <span class="stat"><label>rtf</label><span id="rtf">0.00</span></span>
-        <span class="stat"><label>iter</label><span id="iters">0</span></span>
-        <span class="stat"><label>ep</label><span id="ep-status">—</span></span>
-        <span class="stat"><label>ws</label><span id="conn" class="dot"></span></span>
+        <span class="stat dev-only"><label>iter</label><span id="iters">0</span></span>
+        <span id="run-state" class="chip">idle</span>
+        <span id="ep-status" class="chip dim">no episode</span>
+        <span class="stat" title="API connection"><span id="conn" class="dot"></span></span>
       </div>
     </header>
 
     <aside id="left">
-      <h3>Entities</h3>
-      <ul id="entity-list"></ul>
-      <h3 class="mt">Events <span id="ev-count" class="badge">0</span></h3>
-      <ul id="event-list" class="mono"></ul>
+      <div class="panel">
+        <h3>World <span id="ent-count" class="badge">0</span></h3>
+        <input id="filter" placeholder="filter entities…" />
+        <div id="hierarchy"></div>
+      </div>
+      <div class="panel dev-only replay-only">
+        <h3>Events <span id="ev-count" class="badge">0</span></h3>
+        <ul id="event-list" class="mono"></ul>
+      </div>
     </aside>
 
     <main id="viewport">
-      <div id="overlay-chips">
+      <div id="overlay-chips" class="dev-only">
         <button data-ov="trails" class="on">Trails</button>
+        <button data-ov="planned" class="on">Planned</button>
         <button data-ov="velocity" class="on">Velocity</button>
         <button data-ov="labels" class="on">IDs</button>
         <button data-ov="axes">Axes</button>
@@ -50,35 +64,56 @@
         <button data-ov="collisions" class="on">Collisions</button>
         <button data-ov="collisionGeom">Collision geom</button>
         <button data-ov="bounds">Bounds</button>
+        <button data-ov="areas">Areas</button>
+        <button data-ov="grid">Grid</button>
       </div>
-      <div id="health" class="mono"></div>
-      <div id="toast"></div>
-    </main>
-
-    <aside id="right">
-      <h3 id="sel-title">Telemetry</h3>
-      <div id="telemetry" class="mono">select an entity</div>
       <div id="cam-modes">
         <button data-cam="orbit" class="active">Orbit</button>
         <button data-cam="follow">Follow</button>
         <button data-cam="top">Top</button>
         <button data-cam="fpv">FPV</button>
-        <button id="btn-fit" title="Recentre the camera on all agents (e.g. after one flies out of view)">⤢ Fit view</button>
+        <select id="fpv-cam" class="hidden" title="FPV camera"></select>
+        <button id="btn-fit" title="Frame all moving entities">⤢ Fit</button>
       </div>
-      <div id="manual" class="hidden">
-        <h3 class="mt">Manual control</h3>
+      <div id="toast"></div>
+      <div id="hint" class="hint">click an entity to inspect · space play/pause · drag to orbit · wheel to zoom</div>
+    </main>
+
+    <aside id="right">
+      <div class="panel" id="inspector">
+        <h3 id="sel-title">Inspector</h3>
+        <div id="sel-sub" class="sub"></div>
+        <div id="inspect-body" class="mono">select an entity</div>
+      </div>
+      <div class="panel hidden" id="manual">
+        <h3>Manual control</h3>
         <label class="toggle"><input type="checkbox" id="manual-toggle" /> keyboard → public action API</label>
         <div class="keys mono">W/S fwd·back  A/D left·right<br/>R/F up·down    Q/E yaw<br/>X hold   Z arm/disarm</div>
       </div>
-      <div id="taskpanel" class="hidden">
-        <h3 class="mt">Task <span id="task-status" class="badge"></span></h3>
+      <div class="panel hidden" id="sensors">
+        <h3>Sensor views</h3>
+        <div id="sensor-grid"></div>
+      </div>
+      <div class="panel hidden" id="taskpanel">
+        <h3>Task <span id="task-status" class="badge"></span></h3>
         <div id="task-body" class="mono"></div>
         <div id="task-action" class="bars"></div>
       </div>
-      <div id="sensors" class="hidden">
-        <h3 class="mt">Sensors <span id="sensor-fps" class="badge"></span></h3>
-        <img id="img-camera" alt="camera" /><div class="cap">RGB camera</div>
-        <img id="img-depth" alt="depth" /><div class="cap">Depth (colormap)</div>
+      <div class="panel replay-only" id="replaypanel">
+        <h3>Recording &amp; replay</h3>
+        <div class="row">
+          <button id="btn-rec">● Record rows</button>
+          <button id="btn-snap">📷 Snapshot</button>
+        </div>
+        <div id="rec-status" class="sub mono"></div>
+        <h4>Snapshots</h4>
+        <ul id="snapshot-list" class="list mono"></ul>
+        <h4>Recordings</h4>
+        <ul id="recording-list" class="list mono"></ul>
+      </div>
+      <div class="panel dev-only" id="statuspanel">
+        <h3>Environment status</h3>
+        <div id="status-body" class="mono"></div>
       </div>
     </aside>
   </div>

@@ -155,6 +155,10 @@ class Simulation:
     def set_mode(self, mode: str) -> dict[str, Any]:
         return self._post("/simulation/mode", {"mode": mode})
 
+    def set_speed(self, real_time_factor: float) -> dict[str, Any]:
+        """Target real-time factor for free-running mode (0 = as fast as possible)."""
+        return self._post("/simulation/speed", {"real_time_factor": real_time_factor})
+
     def shutdown(self) -> None:
         self._post("/simulation/shutdown")
 
@@ -224,7 +228,8 @@ class Simulation:
 
     def spawn(self, entity_id: str, *, template: str = "quadcopter", position=(0.0, 0.0, 0.0),
               observation: str | None = None, camera: dict[str, Any] | None = None, drone_type: str = "standard",
-              sensors: list[dict[str, Any]] | None = None, trajectory: dict[str, Any] | None = None, **params) -> None:
+              control: str = "waypoint", sensors: list[dict[str, Any]] | None = None,
+              trajectory: dict[str, Any] | None = None, **params) -> None:
         """Spawn an entity.
         Agents: template 'quadcopter', drone_type standard|light|heavy, sensors=[{name,type,pose,params}].
         Entities: template target|vehicle|platform|beacon|obstacle, trajectory={type: circle|line|waypoints|rotate, ...}."""
@@ -232,7 +237,7 @@ class Simulation:
         self._post("/entities", {"entity_id": entity_id, "template": template,
                                  "pose": {"position": {"x": x, "y": y, "z": z}}, "params": params,
                                  "observation": observation, "camera": camera, "drone_type": drone_type,
-                                 "sensors": sensors, "trajectory": trajectory})
+                                 "control": control, "sensors": sensors, "trajectory": trajectory})
 
     def entity_detail(self, entity_id: str) -> dict[str, Any]:
         """Inspector view: category, type label, dimensions, sensors/mounts, trajectory, physical params, state."""

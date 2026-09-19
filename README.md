@@ -1,9 +1,13 @@
 # env-dr3d — autonomous simulation world
 
-A general-purpose physical simulation environment (**Gazebo Sim Jetty**, headless)
-with a browser interface and an external-agent API. The simulator is authoritative;
-the browser only visualizes, and external Python controllers only talk to the API
-— nobody touches Gazebo directly except the API's engine adapter.
+A general-purpose autonomous-systems simulation platform: Gazebo Sim **Jetty**
+(headless) behind an algorithm-agnostic Simulation API, with a browser control room
+and a Python client. The simulator is authoritative; the browser only visualizes, and
+external programs (scripts, controllers, RL / world-model codebases) talk only to the
+API. **This repository is the environment.** Algorithms live in other codebases and
+connect through `simclient`; `learn/` is kept as a worked example of such a codebase.
+
+![operations view](docs/images/browser-operations.png)
 
 See [`briefs/brief-1.md`](briefs/brief-1.md) for the original goals and
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the decisions
@@ -112,10 +116,10 @@ Then open **http://127.0.0.1:5173** in a browser, and the OpenAPI docs at
 
 ## Using it
 
-1. In the browser's top bar, pick a scenario (only `test_city_two_drones` exists
-   so far) and click **Load** — or equivalently:
+1. In the browser's top bar, pick a scenario (start with `moving_traffic` or
+   `free_flight`; see the scenario library below) and click **Load** — or equivalently:
    ```bash
-   curl -X POST localhost:8000/simulation/load/test_city_two_drones
+   curl -X POST localhost:8000/simulation/load/moving_traffic
    ```
    This generates `runs/<timestamp>_<scenario>/world.sdf`, launches
    `gz sim -s -r` headless against it, and the browser starts rendering as soon
@@ -232,6 +236,63 @@ one flies out of frame — there is no off-screen indicator yet, see Known limit
 .venv/bin/python -m pytest -q tests/integration                # real Gazebo: lifecycle, agents,
                                                                # reproducibility, collisions, frames (~3 min)
 ```
+
+## Phase 3b — environment completeness & world building
+
+The `autonomous_city` world is a small autonomous-operations test facility with five
+areas (operations pads/apron/tower, urban grid, industrial warehouses/tanks/containers,
+open field with a test track, hill and elevated structures), generated from a
+parameterised asset library ([`sim/assets/`](sim/assets/), [`sim/worlds/autonomous_city.py`](sim/worlds/autonomous_city.py)).
+Lighting presets `morning | day | evening | night`, fog/visibility and wind are scenario
+settings; the browser matches the world's sky and sun.
+
+**Scenario library** ([`sim/scenarios/`](sim/scenarios/)): `free_flight`, `urban_navigation`,
+`vertical_navigation`, `moving_traffic`, `multi_agent`, `landing_operations`, `pursuit_arena`,
+plus `entity_showcase`. Scenarios can declare seeded randomisation of agent spawns,
+entity positions and route choices; the same seed reproduces the same draw.
+
+**Entities**: three drone types (`standard`, `light`, `heavy`; consistent mass/inertia/rotor
+constants and type-specific limits), configurable **sensor mounts** (named cameras/depth
+at any pose), vehicles, targets, moving platforms, rotating beacons, static obstacles —
+all spawnable at runtime with deterministic trajectories (`circle | line | waypoints | rotate`).
+`GET /entities/{id}/detail` powers the inspector: category, type, dimensions, collision,
+trajectory, control, sensors, physical parameters.
+
+**State, recording, snapshots, replay** ([`docs/API.md`](docs/API.md)): `GET /world/state`;
+every applied action and spawn/remove/teleport is logged per episode; optional per-step
+*rows* (states, observations, events) form a replay buffer external learners pull
+incrementally; **snapshots** are replay-based (reset + re-apply the log) and restore
+exactly (0.0 m divergence) so experiments can branch from identical states; recordings
+replay deterministically.
+
+### Browser
+
+| Operations | Development |
+|---|---|
+| ![operations](docs/images/browser-operations.png) | ![development](docs/images/browser-development.png) |
+
+| Replay | FPV (drone camera) |
+|---|---|
+| ![replay](docs/images/browser-replay.png) | ![fpv](docs/images/browser-fpv.png) |
+
+Three presentation modes (**Ops** clean view · **Dev** overlays, status, events · **Replay**
+recordings and snapshots), an explicit simulation clock, speed multiplier (¼× … max),
+Realtime/Stepped, step/reset/seed, a world **hierarchy** grouped by category, an
+**inspector**, Orbit/Follow/Top/FPV cameras with smooth transitions and a Fit button,
+per-mount **sensor views**, planned-path and trail overlays, and an **environment status**
+panel (RTF, physics rate, entities, sensors, API, clients, latency). Deep links:
+`/#view=development&select=drone_01&cam=follow`.
+
+### Final environment test (brief 3b §43, zero AI)
+
+```bash
+.venv/bin/python examples/final_environment_test.py
+```
+
+Loads a scenario, spawns 3 drones / 2 vehicles / a moving target among 20+ structures,
+drives one drone human-style, one from Python and one on a scripted path, then checks
+telemetry, sensor feeds, the clock, pause/step, record → snapshot → diverge → **restore
+exactly**, replay, and reset-with-same-seed reproducibility.
 
 ## Phase 3 — the first learned agent
 

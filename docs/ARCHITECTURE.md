@@ -128,3 +128,22 @@ tested and does not restore physics mid-episode in gz-sim 10.5. Per-step *rows*
 (states, observations, events, actions) are an opt-in replay buffer that external
 learners pull incrementally; they are written by the environment, so every algorithm
 codebase gets the same data without re-implementing logging.
+
+
+## World building (Phase 3b)
+
+* `sim/assets/` — palette + parameterised SDF generators; every visual has matching
+  collision geometry except roads/markings (visual-only so they never register as
+  obstacles). `sim/worlds/autonomous_city.py` lays out five areas deterministically and
+  writes the checked-in `autonomous_city.sdf`.
+* Lighting presets and fog are injected at load time (`<!-- @lighting -->` marker) from
+  `environment.time_of_day` / `visibility`; the same numbers are exposed as
+  `SceneDesc.environment` so the browser's sky, sun and fog match Gazebo's.
+* Entity categories (`drone | vehicle | target | dynamic | building | infrastructure |
+  obstacle | terrain`) derive from scenario specs and asset naming conventions
+  (`engine.category_of`); the browser hierarchy and inspector are built on them.
+* **Runtime-spawned entities and reset:** gz-sim's rewind re-creates entities spawned
+  after load (they are in its initial-state snapshot). `reset` therefore removes them
+  before the rewind (avoids the delete-in-contact crash) *and* purges any that the rewind
+  resurrects, polling the scene until it is stable. Recordings log spawn/remove/teleport
+  operations with iteration stamps so replay and snapshot restore re-create them.

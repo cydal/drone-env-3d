@@ -100,6 +100,9 @@ class SimulationEngine(ABC):
     def sensor_mounts(self, agent_id: str) -> list:
         return []
 
+    def set_speed(self, real_time_factor: float) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def frame(self, agent_id: str, sensor: str) -> RawFrame | None: ...
 

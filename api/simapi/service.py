@@ -63,6 +63,7 @@ class SimulationService:
         self.scenario: Scenario | None = None
         self.episode: Episode | None = None
         self.mode: SimMode = "realtime"
+        self.speed: float = 1.0
         self.agents: dict[str, AgentRuntime] = {}
         self._runtime_spawned: set[str] = set()   # not part of the scenario's initial state
         self._runtime_entities: dict[str, Any] = {}  # runtime-spawned non-agent entities with trajectories
@@ -109,6 +110,7 @@ class SimulationService:
             self._close_episode("terminated")
             await self.engine.shutdown()
         self.mode = mode or scenario.simulation.mode
+        self.speed = scenario.simulation.real_time_factor
         # validate profiles before touching the engine
         comps = {a.id: resolve_profile(a.observation, scenario.observation_profiles) for a in scenario.agents}
         if self.mode == "stepped":
@@ -304,6 +306,13 @@ class SimulationService:
         await self.engine.resume()
         return self.status()
 
+    async def set_speed(self, real_time_factor: float) -> SimStatus:
+        if real_time_factor < 0:
+            raise ValueError("speed must be >= 0 (0 = unlimited)")
+        await asyncio.get_running_loop().run_in_executor(None, self.engine.set_speed, real_time_factor)
+        self.speed = real_time_factor
+        return self.status()
+
     async def set_mode(self, mode: SimMode) -> SimStatus:
         self.mode = mode
         if self.episode:
@@ -356,6 +365,7 @@ class SimulationService:
     def status(self) -> SimStatus:
         s = self.engine.status()
         s.mode = self.mode
+        s.speed = self.speed
         if self.scenario:
             s.scenario = self.scenario.name
             s.seed = self.engine.seed
@@ -373,11 +383,11 @@ class SimulationService:
             (t0, i0), (t1, i1) = self._hz_samples[0], self._hz_samples[-1]
             hz = (i1 - i0) / (t1 - t0) if t1 > t0 else 0.0
         fps = {}
-        for aid in self.agents:
-            for s in ("camera", "depth"):
-                r = self.engine.sensor_rate(aid, s)
+        for aid, rt in self.agents.items():
+            for m in rt.spec.camera_mounts:
+                r = self.engine.sensor_rate(aid, m.name)
                 if r:
-                    fps[f"{aid}/{s}"] = round(r, 1)
+                    fps[f"{aid}/{m.name}"] = round(r, 1)
         return Metrics(real_time_factor=st.real_time_factor, sim_hz=hz, step_size=st.step_size or
                        (self.scenario.simulation.step_size if self.scenario else None), sim_time=st.sim_time,
                        entity_count=len(self.engine.list_entities()), agent_count=len(self.agents),
@@ -408,7 +418,7 @@ class SimulationService:
         rt = self.agents.get(entity_id)
         ent = next((e for e in (self.scenario.entities if self.scenario else []) if e.id == entity_id), None) \
             or self._runtime_entities.get(entity_id)
-        category = _category(info.kind, entity_id, model.is_static if model else False)
+        category = info.category
         detail = EntityDetail(entity_id=entity_id, kind=info.kind, category=category, is_agent=info.is_agent,
                               is_static=model.is_static if model else False, dimensions=dims,
                               collision=bool(model and any(l.collisions or l.visuals for l in model.links)),
@@ -441,13 +451,20 @@ class SimulationService:
     async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict,
                     observation: str | None = None, camera: CameraSpec | None = None,
                     drone_type: str = "standard", sensors: list[SensorMount] | None = None,
-                    trajectory=None) -> None:
+                    trajectory=None, control: str = "waypoint") -> None:
         if entity_id in self.agents or any(e.entity_id == entity_id for e in self.engine.list_entities()):
             raise ValueError(f"entity {entity_id!r} already exists")
         sensors = list(sensors or [])
         is_agent = await self.engine.spawn(entity_id, template, pose, params, camera=camera, drone_type=drone_type,
                                            mounts=[m for m in sensors if m.type in ("camera", "depth")])
         self._runtime_spawned.add(entity_id)
+        if self.recorder is not None and not self._replaying:
+            st = self.engine.status()
+            self.recorder.log_op(st.iterations, st.sim_time, "spawn", {
+                "entity_id": entity_id, "template": template, "pose": pose.model_dump(mode="json"), "params": params,
+                "observation": observation, "camera": camera.model_dump(mode="json") if camera else None,
+                "drone_type": drone_type, "sensors": [m.model_dump(mode="json") for m in sensors],
+                "trajectory": trajectory, "control": control})
         if not is_agent and trajectory is not None:
             from .scenario import EntitySpec, TrajectorySpec
             spec_e = EntitySpec(id=entity_id, template=template, spawn=pose, trajectory=TrajectorySpec.model_validate(trajectory), params=params)
@@ -455,7 +472,7 @@ class SimulationService:
             self._runtime_entities[entity_id] = spec_e
         if is_agent:
             spec = AgentSpec(id=entity_id, template=template, spawn=pose, params=params, drone_type=drone_type,
-                             observation=observation or "state", camera=camera, sensors=sensors)
+                             observation=observation or "state", camera=camera, sensors=sensors, control=control)
             comps = resolve_profile(spec.observation, self.scenario.observation_profiles if self.scenario else None)
             self.agents[entity_id] = AgentRuntime(spec, comps)
             self._push_event("agent_spawned", [entity_id], {"template": template})
@@ -463,6 +480,9 @@ class SimulationService:
 
     async def remove(self, entity_id: str) -> None:
         was_agent = entity_id in self.agents
+        if self.recorder is not None and not self._replaying:
+            st = self.engine.status()
+            self.recorder.log_op(st.iterations, st.sim_time, "remove", {"entity_id": entity_id})
         self.agents.pop(entity_id, None)          # before the engine lifts it (no out_of_bounds event)
         self._runtime_spawned.discard(entity_id)
         if entity_id in self._runtime_entities:
@@ -481,6 +501,9 @@ class SimulationService:
         rt = self.agents.get(entity_id)
         if rt is not None:
             rt.waypoint = None          # a teleported agent drops any pending waypoint
+        if self.recorder is not None and not self._replaying:
+            st = self.engine.status()
+            self.recorder.log_op(st.iterations, st.sim_time, "teleport", {"entity_id": entity_id, "pose": pose.model_dump(mode="json")})
 
     def _place_entities(self, sim_time: float) -> None:
         for eid, pose in self._trajectories.targets(sim_time).items():
@@ -746,24 +769,42 @@ class SimulationService:
         return {"recording": meta.__dict__, "replayed_to_iteration": target, "state": self.world_state()}
 
     async def _replay_actions(self, scenario: str, seed: int, actions, until_iteration: int) -> None:
-        self._replaying = True
+        """Reset and re-apply a log. The re-applied operations/actions are logged into the *new*
+        episode's recording, so a restored or replayed episode is self-contained: replaying its
+        own recording from a bare reset reproduces it (the prefix is part of its history)."""
+        self._replaying = False
         try:
             await self.reset(seed=seed, scenario=scenario, mode="stepped")
             if self.scenario is None or self.scenario.name != scenario or self.engine.seed != seed:
                 await self.load_scenario(scenario, seed=seed, mode="stepped")
             cur = 0
+            from .models import ActionEnvelope
             for rec in actions:
                 if rec.iteration > until_iteration:
                     break
                 if rec.iteration > cur:
                     await self._raw_step(rec.iteration - cur); cur = rec.iteration
-                env = Action.__args__ if hasattr(Action, "__args__") else None  # noqa: F841
-                from .models import ActionEnvelope
-                self._apply_action(rec.agent_id, ActionEnvelope.model_validate({"action": rec.action}).action)
+                if rec.op:
+                    await self._replay_op(rec.op, rec.args or {})
+                elif rec.agent_id and rec.action:
+                    self._apply_action(rec.agent_id, ActionEnvelope.model_validate({"action": rec.action}).action)
             if until_iteration > cur:
                 await self._raw_step(until_iteration - cur)
         finally:
             self._replaying = False
+
+    async def _replay_op(self, op: str, a: dict[str, Any]) -> None:
+        if op == "spawn":
+            cam = CameraSpec.model_validate(a["camera"]) if a.get("camera") else None
+            await self.spawn(a["entity_id"], a["template"], Pose.model_validate(a["pose"]), a.get("params") or {},
+                             observation=a.get("observation"), camera=cam, drone_type=a.get("drone_type", "standard"),
+                             sensors=[SensorMount.model_validate(m) for m in a.get("sensors") or []],
+                             trajectory=a.get("trajectory"), control=a.get("control", "waypoint"))
+            await asyncio.sleep(SETTLE_S)      # the new controller must discover our publishers, as at start
+        elif op == "remove":
+            await self.remove(a["entity_id"])
+        elif op == "teleport":
+            self.teleport(a["entity_id"], Pose.model_validate(a["pose"]))
 
     async def _raw_step(self, n: int) -> None:
         """Advance n iterations honouring environment entities and waypoint controllers, without
@@ -922,10 +963,11 @@ class SimulationService:
             s = self.engine.entity_state(aid)
             if s:
                 vel[aid] = [round(s.linear_velocity.x, 3), round(s.linear_velocity.y, 3), round(s.linear_velocity.z, 3)]
+        wps = {aid: [rt.waypoint.x, rt.waypoint.y, rt.waypoint.z] for aid, rt in self.agents.items() if rt.waypoint}
         self.hub.publish_threadsafe({
             "type": "state", "sim_time": sim_time, "paused": st.paused, "mode": self.mode,
             "rtf": st.real_time_factor, "iterations": st.iterations,
-            "poses": {k: _pose_compact(v) for k, v in poses.items()}, "vel": vel,
+            "poses": {k: _pose_compact(v) for k, v in poses.items()}, "vel": vel, "wp": wps,
         })
 
 

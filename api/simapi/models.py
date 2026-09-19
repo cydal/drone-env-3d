@@ -54,6 +54,7 @@ class EntityInfo(BaseModel):
     kind: EntityKind = "unknown"
     is_agent: bool = False
     pose: Pose = Field(default_factory=Pose)
+    category: str = "obstacle"       # drone | vehicle | target | dynamic | building | infrastructure | obstacle | terrain
 
 
 class EntityDetail(BaseModel):
@@ -92,6 +93,7 @@ class SimStatus(BaseModel):
     running: bool = False
     paused: bool = True
     mode: SimMode = "realtime"
+    speed: float = 1.0                       # target real-time factor in realtime mode (0 = unlimited)
     sim_time: float = 0.0
     real_time: float = 0.0
     real_time_factor: float = 0.0
@@ -364,6 +366,7 @@ class SpawnRequest(BaseModel):
     observation: str | None = None               # profile name for agents
     camera: dict[str, Any] | None = None         # legacy CameraSpec fields; prefer `sensors`
     drone_type: str = "standard"                 # standard | light | heavy
+    control: Literal["velocity", "waypoint"] = "waypoint"   # highest action level the new agent accepts
     sensors: list[dict[str, Any]] | None = None  # SensorMount dicts (name, type, pose, params)
     trajectory: dict[str, Any] | None = None     # TrajectorySpec for non-agent entities (circle/line/waypoints/rotate)
 
@@ -415,6 +418,7 @@ class ModelDesc(BaseModel):
     entity_id: str
     kind: EntityKind = "unknown"
     is_agent: bool = False
+    category: str = "obstacle"
     pose: Pose = Field(default_factory=Pose)    # world frame
     links: list[LinkDesc] = Field(default_factory=list)
     is_static: bool = False

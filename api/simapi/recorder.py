@@ -27,10 +27,14 @@ from .models import Action, EntityState
 
 @dataclass
 class ActionRecord:
+    """One logged event: an agent action (`action`), or a world operation (`op` in
+    spawn | remove | teleport with `args`). Both carry the iteration they were applied at."""
     iteration: int
     sim_time: float
-    agent_id: str
-    action: dict[str, Any]
+    agent_id: str | None = None
+    action: dict[str, Any] | None = None
+    op: str | None = None
+    args: dict[str, Any] | None = None
 
 
 @dataclass
@@ -67,9 +71,14 @@ class Recorder:
 
     # ---- actions (always) ----------------------------------------------------
     def log_action(self, iteration: int, sim_time: float, agent_id: str, action: Action) -> None:
-        rec = ActionRecord(iteration, sim_time, agent_id, action.model_dump(mode="json"))
+        self._log(ActionRecord(iteration, sim_time, agent_id=agent_id, action=action.model_dump(mode="json")))
+
+    def log_op(self, iteration: int, sim_time: float, op: str, args: dict[str, Any]) -> None:
+        self._log(ActionRecord(iteration, sim_time, op=op, args=args))
+
+    def _log(self, rec: ActionRecord) -> None:
         self.actions.append(rec)
-        self._actions_f.write(json.dumps(rec.__dict__, separators=(",", ":")) + "\n")
+        self._actions_f.write(json.dumps(rec.__dict__, separators=(",", ":"), default=_default) + "\n")
         self.meta.actions = len(self.actions)
 
     # ---- rows (opt-in replay buffer) ------------------------------------------
