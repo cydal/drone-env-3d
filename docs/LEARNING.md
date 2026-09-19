@@ -36,7 +36,14 @@ What differs is where the numbers come from:
 | `navigation` | `navigation` | GPS → local ENU metres, body velocity rotated by IMU heading |
 | `vision` | `vision_nav` (camera, depth, imu, gps, velocity) | as navigation; the policy fetches frames itself via `sim.frame()` |
 
-**Action (3)**: `[-1, 1]^3` → world-frame velocity setpoint × `max_speed` (3 m/s).
+**Obstacle extension** (`obstacle_features=K`, Level 2+): appends, for the K nearest static
+obstacles, `(dx, dy, radius, top_z − drone_z)` read from the scene description (privileged
+state). Without it the 12-d vector carries no obstacle information and pillars are simply
+unobservable to the policy — Experiment B's first run (0 % success, 50 % collisions after
+50k steps) was an observability problem, not a learning one. Experiment A uses K = 0.
+
+**Action (3)**: `[-1, 1]^3` → world-frame velocity setpoint × `max_speed` (3 m/s), clamped
+to the agent's advertised limits before sending (a rejected action is a hard error).
 The simulator's `MulticopterVelocityControl` turns it into rotor thrusts.
 
 **Reward** (`RewardConfig`, outside the simulator): `+progress·Δdistance − time_penalty
@@ -82,11 +89,11 @@ Artefacts:
 
 | exp | observation | level | status |
 |---|---|---|---|
-| A | state | open | see README results |
-| B | state | pillars | evaluate with `--evalset level2_pillars_eval` |
-| C | randomised start/target | (built in: training samples, evaluation uses unseen fixed pairs) | |
-| D | navigation | open | baseline validated; train with `--observation navigation` |
-| E | vision | open | pipeline validated (frames + task); training needs a CNN policy and a Linux/GPU box for throughput |
+| A | state | open | **done**: PPO 20/20 on the fixed unseen set, 0 collisions, 8.6 s to target (= engineered controller); 150k steps, 4 simulators, ~36 min |
+| B | state + 3 nearest obstacles | pillars | training (`ppo_pillars_state_obs`, 200k steps); waypoint baseline 4/20, 15 collisions |
+| C | randomised start/target | built in: training samples random pairs, evaluation uses fixed pairs never seen in training | done with A |
+| D | navigation (GPS/IMU/velocity) | open | baseline 20/20 under navigation observations; train with `--observation navigation` |
+| E | vision | open | pipeline validated (67 task steps/s with 128×96 rgb+depth); training needs a CNN policy and more compute |
 
 Do not advance a level because the model *trains*; advance when its evaluation on
 the fixed set meets the level's criterion (open: ≥ 90 % success, 0 collisions).

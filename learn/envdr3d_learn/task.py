@@ -63,6 +63,9 @@ class RewardConfig:
     out_of_bounds: float = 5.0
     reached: float = 10.0
     action_penalty: float = 0.005  # * |action|^2 per step (smoothness)
+    proximity_penalty: float = 0.0 # * max(0, safe_margin - clearance) per step; clearance = horizontal distance
+                                   #   to the nearest obstacle surface (needs obstacle_features > 0). 0 = off.
+    safe_margin: float = 2.0       # m
 
 
 @dataclass
@@ -197,6 +200,11 @@ class NavigationTask:
         r = self.cfg.reward
         reward = (r.progress * (self.prev_distance - dist) - r.distance_penalty * dist
                   - r.time_penalty - r.action_penalty * float(np.sum(a * a)))
+        clearance = None
+        if r.proximity_penalty > 0 and self._obstacles:
+            clearance = min(math.hypot(o[0] - pos[0], o[1] - pos[1]) - o[2] for o in self._obstacles
+                            if o[3] > pos[2] - 0.5)              # only obstacles that reach the drone's altitude
+            reward -= r.proximity_penalty * max(0.0, r.safe_margin - clearance)
         terminated, termination = False, None
         if reached:
             reward += r.reached; terminated, termination = True, "reached"
@@ -216,7 +224,7 @@ class NavigationTask:
         self.collisions += int(collided)
         self.return_ += reward
         self.prev_distance, self.prev_pos, self.prev_action = dist, pos, a
-        info = self._info(st, distance=dist, events=events, reward=reward, termination=termination)
+        info = self._info(st, distance=dist, events=events, reward=reward, termination=termination, clearance=clearance)
         if self.recorder:
             self.recorder.record(obs, a, reward, st, events, info)
         if terminated or truncated:
