@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: env-dr3d
+Version: 0.1.0
+Summary: General-purpose physical simulation environment (Gazebo Sim) with a browser UI and an external-agent API
+Requires-Python: >=3.12
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: httpx>=0.27
+Requires-Dist: websockets>=12
+Requires-Dist: numpy>=1.26
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"

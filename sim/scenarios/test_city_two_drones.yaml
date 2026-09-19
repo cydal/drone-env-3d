@@ -1,0 +1,25 @@
+name: test_city_two_drones
+description: Two quadcopters on the alpha landing pad in the test city.
+world:
+  name: test_city
+  file: test_city.sdf
+agents:
+  - id: drone_01
+    type: drone
+    template: quadcopter
+    spawn:
+      position: {x: 0.0, y: 1.0, z: 0.2}
+    params: {color: "0.95 0.45 0.10 1"}
+  - id: drone_02
+    type: drone
+    template: quadcopter
+    spawn:
+      position: {x: 0.0, y: -1.0, z: 0.2}
+    params: {color: "0.15 0.65 0.95 1"}
+environment:
+  wind: {x: 0.0, y: 0.0, z: 0.0}
+simulation:
+  step_size: 0.004
+  real_time_factor: 1.0
+  seed: 18372
+  start_paused: false

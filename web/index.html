@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>env-dr3d · simulation</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">ENV<span>·</span>DR3D</div>
+      <div id="sim-controls">
+        <button id="btn-play" title="Play/Pause (space)">▶</button>
+        <button id="btn-step" title="Step">⏭</button>
+        <button id="btn-reset" title="Reset">↺</button>
+        <span class="stat"><label>t</label><span id="sim-time">0.000</span>s</span>
+        <span class="stat"><label>rtf</label><span id="rtf">0.00</span></span>
+        <span class="stat"><label>iter</label><span id="iters">0</span></span>
+        <span class="stat"><label>ws</label><span id="conn" class="dot"></span></span>
+      </div>
+      <div id="scenario-box">
+        <select id="scenario-select"></select>
+        <button id="btn-load">Load</button>
+      </div>
+    </header>
+    <aside id="left">
+      <h3>Entities</h3>
+      <ul id="entity-list"></ul>
+    </aside>
+    <main id="viewport"></main>
+    <aside id="right">
+      <h3 id="sel-title">Telemetry</h3>
+      <div id="telemetry" class="mono">select an entity</div>
+      <div id="cam-modes">
+        <button data-cam="orbit" class="active">Orbit</button>
+        <button data-cam="follow">Follow</button>
+        <button data-cam="top">Top</button>
+      </div>
+    </aside>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
