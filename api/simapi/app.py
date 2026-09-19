@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 
 from .hub import TelemetryHub
-from .models import (ActionEnvelope, AgentInfo, Episode, Event, Metrics, ModeRequest, Observation,
+from .models import (ActionEnvelope, AgentInfo, Episode, Event, Metrics, ModeRequest, Observation, Pose,
                      ResetRequest, SimStatus, SpawnRequest, StepRequest, StepResponse)
 from .scenario import Scenario
 from .sensors import FrameEncoder
@@ -174,6 +174,15 @@ def create_app(engine_factory=None) -> FastAPI:
             raise _err(e)
         return {"spawned": req.entity_id}
 
+    @app.post("/entities/{entity_id}/pose")
+    async def teleport(entity_id: str, pose: Pose):
+        """Kinematic placement (world frame). Applied on the next iteration; step once in stepped mode."""
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, service.teleport, entity_id, pose)
+        except Exception as e:
+            raise _err(e)
+        return {"ok": True}
+
     @app.delete("/entities/{entity_id}")
     async def remove(entity_id: str):
         try:
@@ -237,6 +246,23 @@ def create_app(engine_factory=None) -> FastAPI:
         headers = {f"X-Sensor-{k}": str(v) for k, v in meta.items() if k != "content_type"}
         headers["Cache-Control"] = "no-store"
         return Response(content=data, media_type=meta["content_type"], headers=headers)
+
+    # ---- overlay: task/tool annotations for the browser (simulator stays task-agnostic) ---
+    @app.post("/overlay")
+    async def overlay(body: dict):
+        service.overlay = body
+        hub.publish_threadsafe({"type": "overlay", "data": body})
+        return {"ok": True}
+
+    @app.get("/overlay")
+    def get_overlay():
+        return service.overlay or {}
+
+    @app.delete("/overlay")
+    async def clear_overlay():
+        service.overlay = None
+        hub.publish_threadsafe({"type": "overlay", "data": None})
+        return {"ok": True}
 
     # ---- events -----------------------------------------------------------
     @app.get("/events", response_model=list[Event])

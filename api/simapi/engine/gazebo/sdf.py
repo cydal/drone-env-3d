@@ -217,12 +217,14 @@ def target_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool 
     params = params or {}
     r = float(params.get("radius", 0.5))
     color = params.get("color", "1.0 0.2 0.2 1")
+    collision = "" if params.get("collide", True) in (False, "false", 0) else \
+        f'<collision name="collision"><geometry><sphere><radius>{r}</radius></sphere></geometry></collision>'
     model = f"""
   <model name="{escape(entity_id)}">
     <link name="link">
       <gravity>false</gravity>
       <inertial><mass>1</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz></inertia></inertial>
-      <collision name="collision"><geometry><sphere><radius>{r}</radius></sphere></geometry></collision>
+      {collision}
       <visual name="visual"><geometry><sphere><radius>{r}</radius></sphere></geometry>{_material(color)}</visual>
       <visual name="ring">
         <geometry><cylinder><radius>{r * 1.6}</radius><length>0.03</length></cylinder></geometry>

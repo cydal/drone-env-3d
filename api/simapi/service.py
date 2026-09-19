@@ -60,6 +60,7 @@ class SimulationService:
         self.mode: SimMode = "realtime"
         self.agents: dict[str, AgentRuntime] = {}
         self._runtime_spawned: set[str] = set()   # not part of the scenario's initial state
+        self.overlay: dict | None = None            # last annotation pushed by an external tool
         self.events: collections.deque[Event] = collections.deque(maxlen=5000)
         self._event_seq = 0
         self._events_total = 0
@@ -344,6 +345,15 @@ class SimulationService:
         if was_agent:
             self._push_event("agent_removed", [entity_id], {})
         self.hub.publish_threadsafe({"type": "scene_changed"})
+
+    def teleport(self, entity_id: str, pose: Pose) -> None:
+        """Kinematically place any entity (used by task wrappers to randomise starts/targets)."""
+        if not any(e.entity_id == entity_id for e in self.engine.list_entities()):
+            raise ValueError(f"unknown entity {entity_id!r}")
+        self.engine.set_pose(entity_id, pose)
+        rt = self.agents.get(entity_id)
+        if rt is not None:
+            rt.waypoint = None          # a teleported agent drops any pending waypoint
 
     def _place_entities(self, sim_time: float) -> None:
         for eid, pose in self._trajectories.targets(sim_time).items():

@@ -122,7 +122,8 @@ class GazeboEngine(SimulationEngine):
         self._event_cb: Callable[[EngineEvent], None] | None = None
         self._stats_event = threading.Event()
         self._want_paused = True
-        self._last_pose_time = -1.0
+        self._last_pose_time = 0.0
+        self._derived_iterations = 0
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -232,10 +233,13 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             for a in self._agents.values():
                 a.reset_transients()
+            self._last_pose_time = 0.0
 
     def _reset_blocking(self) -> None:
         with self._lock:
             pre_iter = self._stats.iterations if self._stats else 0
+            pre_t = max(_t(self._stats.sim_time) if self._stats else 0.0, self._last_pose_time)
+            pre_iter = max(pre_iter, int(round(pre_t / (self.scenario.simulation.step_size if self.scenario else 0.004))))
         if pre_iter == 0:
             return                      # nothing has advanced yet; state is already initial
         for attempt in range(2):
@@ -244,9 +248,12 @@ class GazeboEngine(SimulationEngine):
             while time.time() < deadline:
                 with self._lock:
                     it = self._stats.iterations if self._stats else pre_iter
-                if it < pre_iter:
+                    pose_t = self._last_pose_time
+                if it < pre_iter or (pose_t >= 0 and pose_t < pre_t - 1e-6):
+                    with self._lock:
+                        self._last_pose_time = 0.0    # rewound: restart the pose clock
                     return
-                time.sleep(0.01)
+                time.sleep(0.005)
             log.warning("reset not observed (iterations still %s), retrying", it)
         raise RuntimeError("Gazebo did not apply the world reset")
 
@@ -270,34 +277,23 @@ class GazeboEngine(SimulationEngine):
         await asyncio.get_running_loop().run_in_executor(None, self._step_blocking, steps)
 
     def _step_blocking(self, steps: int) -> None:
+        """Advance exactly `steps` iterations. Completion is detected from the pose stream,
+        which Gazebo publishes every iteration with an exact sim-time stamp (world stats
+        arrive at only 10 Hz and would cap short RL steps at ~10/s)."""
+        dt = self.scenario.simulation.step_size if self.scenario else 0.004
         with self._lock:
-            start_iter = self._stats.iterations if self._stats else 0
-        time.sleep(0.005)  # let in-flight action messages land in the controller systems
+            start_t = self.sim_time()
+        time.sleep(0.003)  # let in-flight action messages land in the controller systems
         self._control(pause=True, multi_step=steps)
-        target = start_iter + steps
-        step_size = self.scenario.simulation.step_size if self.scenario else 0.004
-        deadline = time.time() + 5.0 + steps * step_size * 4
-        it = start_iter
+        target_t = start_t + steps * dt
+        deadline = time.time() + 5.0 + steps * dt * 4
         while time.time() < deadline:
             with self._lock:
-                it = self._stats.iterations if self._stats else 0
-                paused = self._stats.paused if self._stats else False
-                final_t = _t(self._stats.sim_time) if self._stats else 0.0
-            if it >= target and paused:
-                break
-            time.sleep(0.002)
-        else:
-            log.warning("step(%d) did not complete in time (at %s/%s)", steps, it, target)
-            return
-        # Poses are published every iteration; wait until the pose stamped with the final
-        # sim time has been delivered so entity_state() reflects exactly the stepped state.
-        deadline = time.time() + 1.0
-        while time.time() < deadline:
-            with self._lock:
-                if self._last_pose_time >= final_t - 1e-9:
+                if self._last_pose_time >= target_t - dt * 0.5:
+                    self._derived_iterations = int(round(self._last_pose_time / dt))
                     return
             time.sleep(0.001)
-        log.warning("final pose for t=%.4f not received (last %.4f)", final_t, self._last_pose_time)
+        log.warning("step(%d) did not complete in time (pose t=%.4f, target %.4f)", steps, self._last_pose_time, target_t)
 
     def status(self) -> SimStatus:
         with self._lock:
@@ -305,13 +301,21 @@ class GazeboEngine(SimulationEngine):
             running = self.proc.alive()
             if s is None:
                 return SimStatus(running=running, world=self.world or None)
-            return SimStatus(running=running, paused=s.paused, sim_time=_t(s.sim_time),
+            sim_t = _t(s.sim_time)
+            iters = s.iterations
+            if self._last_pose_time > sim_t + 1e-9:          # pose clock is ahead of stats
+                dt = self.scenario.simulation.step_size if self.scenario else 0.004
+                sim_t = self._last_pose_time
+                iters = int(round(sim_t / dt))
+            paused = s.paused or (self._want_paused and self._last_pose_time > _t(s.sim_time) + 1e-9)
+            return SimStatus(running=running, paused=paused, sim_time=sim_t,
                              real_time=_t(s.real_time), real_time_factor=s.real_time_factor,
-                             iterations=s.iterations, world=self.world)
+                             iterations=iters, world=self.world)
 
     def sim_time(self) -> float:
         with self._lock:
-            return _t(self._stats.sim_time) if self._stats else 0.0
+            st = _t(self._stats.sim_time) if self._stats else 0.0
+            return max(st, self._last_pose_time)
 
     # ------------------------------------------------------------------ callbacks (transport threads)
     def _emit(self, name: str, sim_time: float, entities: list[str], data: dict[str, Any]) -> None:

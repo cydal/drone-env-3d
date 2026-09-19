@@ -1,0 +1,32 @@
+name: nav_level3_city
+description: Level 3 navigation. The test city; start west of the plaza, target east beyond the tower.
+world:
+  name: test_city
+  file: test_city.sdf
+  bounds: {x: [-150, 150], y: [-150, 150], z: [-1, 60]}
+agents:
+  - id: drone_01
+    type: drone
+    template: quadcopter
+    spawn: {position: {x: 0.0, y: 0.0, z: 0.2}}
+    observation: state
+    control: velocity
+    limits: {max_speed_xy: 4.0, max_speed_z: 2.0, max_yaw_rate: 1.5}
+    params: {color: "0.95 0.45 0.10 1"}
+entities:
+  - id: target
+    type: target
+    template: target
+    spawn: {position: {x: 15.0, y: 0.0, z: 5.0}}
+    trajectory: {type: static}
+    params: {radius: 0.6, color: "0.2 0.9 0.4 1", collide: false}
+simulation:
+  step_size: 0.004
+  real_time_factor: 0.0
+  seed: 1
+  start_paused: true
+  mode: stepped
+episode:
+  terminate_on: []
+logging:
+  enabled: false

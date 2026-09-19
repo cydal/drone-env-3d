@@ -229,6 +229,14 @@ class Simulation:
                                  "pose": {"position": {"x": x, "y": y, "z": z}}, "params": params,
                                  "observation": observation, "camera": camera})
 
+    def set_pose(self, entity_id: str, position, yaw: float = 0.0) -> None:
+        """Teleport an entity (world frame). Applied on the next physics iteration."""
+        import math
+        x, y, z = position
+        self._post(f"/entities/{entity_id}/pose", {
+            "position": {"x": x, "y": y, "z": z},
+            "orientation": {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2), "w": math.cos(yaw / 2)}})
+
     def remove(self, entity_id: str) -> None:
         r = self._http.delete(f"/entities/{entity_id}")
         r.raise_for_status()
@@ -260,6 +268,13 @@ class Simulation:
                 meta = json.loads(ws.recv())
                 data = ws.recv()
                 yield meta, data
+
+    def overlay(self, data: dict[str, Any] | None) -> None:
+        """Publish task/tool annotations for the browser (target, reward, status...). Simulator-agnostic."""
+        if data is None:
+            self._http.delete("/overlay")
+        else:
+            self._post("/overlay", data)
 
     def wait_until_ready(self, timeout: float = 60.0) -> None:
         deadline = time.time() + timeout
