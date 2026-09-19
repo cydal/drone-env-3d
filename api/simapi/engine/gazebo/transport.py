@@ -23,6 +23,7 @@ def gz() -> dict[str, Any]:
             return _gz
         from gz.transport import Node  # Jetty (gz-transport15) — unsuffixed module
         from gz.msgs.boolean_pb2 import Boolean
+        from gz.msgs.contacts_pb2 import Contacts
         from gz.msgs.empty_pb2 import Empty
         from gz.msgs.entity_factory_pb2 import EntityFactory
         from gz.msgs.entity_pb2 import Entity
@@ -38,7 +39,7 @@ def gz() -> dict[str, Any]:
         from gz.msgs.world_control_pb2 import WorldControl
         from gz.msgs.world_stats_pb2 import WorldStatistics
         _gz.update(dict(
-            Node=Node, Boolean=Boolean, Empty=Empty, EntityFactory=EntityFactory, Entity=Entity,
+            Node=Node, Boolean=Boolean, Contacts=Contacts, Empty=Empty, EntityFactory=EntityFactory, Entity=Entity,
             Image=Image, IMU=IMU, NavSat=NavSat, Odometry=Odometry, Pose=Pose, Pose_V=Pose_V,
             Scene=Scene, StringMsg_V=StringMsg_V, Twist=Twist, WorldControl=WorldControl,
             WorldStatistics=WorldStatistics,

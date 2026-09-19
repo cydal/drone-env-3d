@@ -6,6 +6,7 @@ api/simapi/app.py
 api/simapi/config.py
 api/simapi/hub.py
 api/simapi/models.py
+api/simapi/observation.py
 api/simapi/scenario.py
 api/simapi/service.py
 api/simapi/engine/__init__.py
@@ -22,3 +23,4 @@ env_dr3d.egg-info/SOURCES.txt
 env_dr3d.egg-info/dependency_links.txt
 env_dr3d.egg-info/requires.txt
 env_dr3d.egg-info/top_level.txt
+tests/test_api_fake_engine.py

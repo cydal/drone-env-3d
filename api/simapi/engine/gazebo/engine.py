@@ -1,40 +1,41 @@
-"""GazeboEngine: SimulationEngine implemented on top of a headless `gz sim -s`
-server driven over gz-transport (Gazebo Sim Jetty / gz-sim 10).
+"""GazeboEngine: SimulationEngine on top of a headless `gz sim -s` server driven
+over gz-transport (Gazebo Sim Jetty / gz-sim 10).
 
-Topics/services used (world name W, agent id A):
-  /world/W/control              service  gz.msgs.WorldControl -> Boolean   (pause/step/reset)
-  /world/W/stats                topic    gz.msgs.WorldStatistics
-  /world/W/scene/info           service  Empty -> gz.msgs.Scene            (entity tree + geometry)
-  /world/W/dynamic_pose/info    topic    gz.msgs.Pose_V                    (moving entities @60Hz)
-  /world/W/create               service  gz.msgs.EntityFactory -> Boolean  (spawn)
-  /world/W/remove               service  gz.msgs.Entity -> Boolean
-  /model/A/odometry             topic    gz.msgs.Odometry                  (OdometryPublisher system)
-  /A/imu                        topic    gz.msgs.IMU
-  /A/cmd/twist                  topic    gz.msgs.Twist   -> MulticopterVelocityControl
-  /A/cmd/enable                 topic    gz.msgs.Boolean -> MulticopterVelocityControl
+Topics/services used (world W, agent A):
+  /world/W/control              service  WorldControl -> Boolean   (pause/step/reset)
+  /world/W/stats                topic    WorldStatistics
+  /world/W/scene/info           service  Empty -> Scene            (entity tree + geometry)
+  /world/W/dynamic_pose/info    topic    Pose_V                    (moving entities @60Hz)
+  /world/W/create | /remove     service  EntityFactory | Entity -> Boolean
+  /world/W/set_pose             service  Pose -> Boolean           (kinematic placement)
+  /model/A/odometry             topic    Odometry                  (OdometryPublisher system)
+  /A/imu  /A/navsat  /A/contacts  /A/camera  /A/depth              (sensors)
+  /A/cmd/twist  /A/cmd/enable                                      (MulticopterVelocityControl)
 """
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
 import logging
-import math
-import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ... import config
-from ...models import (Action, ArmAction, EntityInfo, EntityState, Geometry, ImuReading, LinkDesc,
-                       ModelDesc, Pose, Quat, SceneDesc, SimStatus, Vec3, VelocityAction, Visual)
-from ...scenario import Scenario
-from ..base import SimulationEngine
+from ...models import (EntityInfo, EntityState, Geometry, GpsReading, ImuReading, LinkDesc, ModelDesc,
+                       Pose, Quat, SceneDesc, SimStatus, Vec3, VelocityAction, Visual)
+from ...scenario import CameraSpec, Scenario
+from ..base import EngineEvent, RawFrame, SimulationEngine
 from . import sdf as sdfgen
 from .process import GazeboProcess
 from .transport import Transport
 
 log = logging.getLogger(__name__)
+
+LANDING_SURFACES = ("ground", "pad_")       # contact with these = landing/takeoff, not collision
+CONTACT_COOLDOWN_S = 0.5                    # sim seconds before the same pair re-emits a collision
+GROUND_CONTACT_TIMEOUT_S = 0.15             # sim seconds without ground contact -> airborne
 
 
 def _t(msg_time) -> float:
@@ -50,22 +51,52 @@ def _rotate(q: Quat, v: Vec3) -> Vec3:
     """Rotate body-frame vector v into the world frame by quaternion q."""
     x, y, z, w = q.x, q.y, q.z, q.w
     vx, vy, vz = v.x, v.y, v.z
-    # t = 2 * cross(q.xyz, v)
     tx, ty, tz = 2 * (y * vz - z * vy), 2 * (z * vx - x * vz), 2 * (x * vy - y * vx)
     return Vec3(x=vx + w * tx + (y * tz - z * ty),
                 y=vy + w * ty + (z * tx - x * tz),
                 z=vz + w * tz + (x * ty - y * tx))
 
 
+class _RateMeter:
+    def __init__(self) -> None:
+        self.count = 0
+        self.t0 = time.monotonic()
+        self.rate = 0.0
+
+    def tick(self) -> None:
+        self.count += 1
+        now = time.monotonic()
+        if now - self.t0 >= 1.0:
+            self.rate = self.count / (now - self.t0)
+            self.count, self.t0 = 0, now
+
+
 class _AgentIO:
-    def __init__(self, agent_id: str) -> None:
+    def __init__(self, agent_id: str, camera: CameraSpec | None) -> None:
         self.id = agent_id
+        self.camera = camera
         self.odom = None
-        self.imu = None
         self.odom_time = 0.0
         self.prev_vel: Vec3 | None = None
         self.prev_vel_time = 0.0
         self.accel: Vec3 | None = None
+        self.imu = None
+        self.navsat = None
+        self.frames: dict[str, RawFrame] = {}
+        self.rates: dict[str, _RateMeter] = {}
+        self.seq: dict[str, int] = {}
+        # contact bookkeeping
+        self.last_ground_contact: float = -1.0
+        self.grounded: bool | None = None
+        self.pair_last: dict[str, float] = {}
+
+    def reset_transients(self) -> None:
+        self.odom = self.imu = self.navsat = None
+        self.prev_vel = self.accel = None
+        self.frames.clear()
+        self.last_ground_contact = -1.0
+        self.grounded = None
+        self.pair_last.clear()
 
 
 class GazeboEngine(SimulationEngine):
@@ -76,25 +107,31 @@ class GazeboEngine(SimulationEngine):
         self.world = ""
         self.run_dir: Path | None = None
         self.rendering = False
+        self._seed = 0
 
         self._lock = threading.RLock()
         self._stats = None
         self._scene_msg = None
-        self._model_ids: dict[int, str] = {}            # gz entity id -> model name (top-level)
+        self._model_ids: dict[int, str] = {}
         self._poses: dict[str, Pose] = {}
         self._agents: dict[str, _AgentIO] = {}
-        self._static: set[str] = set()
-        self._dynamic: set[str] = set()                 # names seen on dynamic_pose/info
+        self._kinds: dict[str, str] = {}
+        self._dynamic: set[str] = set()
         self._pose_cb: Callable[[float, dict[str, Pose]], None] | None = None
+        self._event_cb: Callable[[EngineEvent], None] | None = None
         self._stats_event = threading.Event()
-        self._want_paused = True                          # desired state; observed state flickers during multi-step
+        self._want_paused = True
 
     # ------------------------------------------------------------------ lifecycle
-    async def start(self, scenario: Scenario) -> None:
+    @property
+    def seed(self) -> int:
+        return self._seed
+
+    async def start(self, scenario: Scenario, *, seed: int | None = None) -> None:
         self.scenario = scenario
         self.world = scenario.world.name
-        self.rendering = bool(scenario.agents and any(a.sensors.get("camera") for a in scenario.agents)) \
-            or bool(getattr(scenario, "rendering", False))
+        self.rendering = scenario.rendering
+        self._seed = scenario.simulation.seed if seed is None else int(seed)
 
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.run_dir = config.RUNS_DIR / f"{stamp}_{scenario.name}"
@@ -102,13 +139,13 @@ class GazeboEngine(SimulationEngine):
         scenario.save(self.run_dir / "scenario.yaml")
 
         base = (config.WORLDS_DIR / scenario.world.file).read_text()
-        world_sdf = sdfgen.build_world_sdf(base, scenario, rendering=self.rendering)
         world_file = self.run_dir / "world.sdf"
-        world_file.write_text(world_sdf)
+        world_file.write_text(sdfgen.build_world_sdf(base, scenario))
 
-        self._want_paused = scenario.simulation.start_paused
-        self.proc.start(world_file, run=not scenario.simulation.start_paused,
-                        seed=scenario.simulation.seed, rendering=self.rendering, log_dir=self.run_dir)
+        start_paused = scenario.simulation.start_paused or scenario.simulation.mode == "stepped"
+        self._want_paused = start_paused
+        self.proc.start(world_file, run=not start_paused, seed=self._seed,
+                        rendering=self.rendering, log_dir=self.run_dir)
 
         self.tp = Transport()
         g = self.tp.g
@@ -116,17 +153,19 @@ class GazeboEngine(SimulationEngine):
         self.tp.subscribe(g["WorldStatistics"], f"/world/{self.world}/stats", self._on_stats)
         self.tp.subscribe(g["Pose_V"], f"/world/{self.world}/dynamic_pose/info", self._on_dynamic_pose)
         await asyncio.get_running_loop().run_in_executor(None, self._wait_for_world, 60.0)
+
+        with self._lock:
+            self._kinds = {a.id: a.type for a in scenario.agents}
+            self._kinds.update({e.id: e.type for e in scenario.entities})
         await self._refresh_scene()
         for a in scenario.agents:
-            self._attach_agent(a.id)
-        log.info("world '%s' ready, agents=%s", self.world, list(self._agents))
+            self._attach_agent(a.id, a.camera)
+        log.info("world '%s' ready (seed=%s, rendering=%s), agents=%s",
+                 self.world, self._seed, self.rendering, list(self._agents))
 
     def _wait_for_world(self, timeout: float) -> None:
-        """Ready when the *new* server publishes world stats and serves /control.
-
-        A stale discovery entry from a previous server in this process would make a
-        pure service_list() check pass too early, so we require a live stats message.
-        """
+        """Ready when the *new* server publishes stats and serves /control (a stale
+        discovery entry from a previous server would make service_list() lie)."""
         deadline = time.time() + timeout
         target = f"/world/{self.world}/control"
         while time.time() < deadline:
@@ -141,7 +180,7 @@ class GazeboEngine(SimulationEngine):
         for _ in range(attempts):
             try:
                 return self.tp.request(service, req, rep_cls, timeout_ms)
-            except TimeoutError as e:  # stale discovery entry or server still loading
+            except TimeoutError as e:
                 last = e
                 time.sleep(0.3)
         raise last  # type: ignore[misc]
@@ -158,18 +197,16 @@ class GazeboEngine(SimulationEngine):
             self._model_ids.clear()
             self._poses.clear()
             self._agents.clear()
-            self._static.clear()
+            self._kinds.clear()
             self._dynamic.clear()
         self.scenario = None
 
     def _control(self, **fields) -> None:
         g = self.tp.g
         msg = g["WorldControl"]()
-        # Every WorldControl message re-applies `pause`, so always send the *desired*
-        # state explicitly (the observed state is transiently false during a multi-step).
         if "pause" in fields:
             self._want_paused = bool(fields.pop("pause"))
-        msg.pause = self._want_paused
+        msg.pause = self._want_paused            # every WorldControl re-applies pause
         if "multi_step" in fields:
             msg.multi_step = fields.pop("multi_step")
         if fields.pop("reset_all", False):
@@ -181,9 +218,17 @@ class GazeboEngine(SimulationEngine):
         await loop.run_in_executor(None, lambda: self._control(reset_all=True))
         with self._lock:
             for a in self._agents.values():
-                a.odom = a.imu = None
-                a.prev_vel = a.accel = None
-        # After reset the multicopter controllers are re-created and idle until commanded.
+                a.reset_transients()
+        # wait for iterations to read 0 so callers see a consistent state
+        await loop.run_in_executor(None, self._wait_iterations_reset)
+
+    def _wait_iterations_reset(self) -> None:
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._stats is not None and self._stats.iterations < 5:
+                    return
+            time.sleep(0.01)
 
     async def pause(self) -> None:
         await asyncio.get_running_loop().run_in_executor(None, lambda: self._set_paused(True))
@@ -193,7 +238,6 @@ class GazeboEngine(SimulationEngine):
 
     def _set_paused(self, paused: bool) -> None:
         self._control(pause=paused)
-        # stats arrive at ~10 Hz; wait briefly so status() reflects the new state
         deadline = time.time() + 0.6
         while time.time() < deadline:
             with self._lock:
@@ -202,27 +246,25 @@ class GazeboEngine(SimulationEngine):
             time.sleep(0.01)
 
     async def step(self, steps: int = 1) -> None:
-        """Advance exactly `steps` iterations while paused, and block until done."""
         steps = max(1, int(steps))
         await asyncio.get_running_loop().run_in_executor(None, self._step_blocking, steps)
 
     def _step_blocking(self, steps: int) -> None:
         with self._lock:
             start_iter = self._stats.iterations if self._stats else 0
-        # Give in-flight action messages a moment to reach the controller systems before
-        # the world advances (transport is asynchronous; see docs/ARCHITECTURE.md).
-        time.sleep(0.005)
+        time.sleep(0.005)  # let in-flight action messages land in the controller systems
         self._control(pause=True, multi_step=steps)
         target = start_iter + steps
         step_size = self.scenario.simulation.step_size if self.scenario else 0.004
-        deadline = time.time() + 5.0 + steps * step_size * 4  # generous: RTF may be < 1
+        deadline = time.time() + 5.0 + steps * step_size * 4
+        it = start_iter
         while time.time() < deadline:
             with self._lock:
                 it = self._stats.iterations if self._stats else 0
                 paused = self._stats.paused if self._stats else False
             if it >= target and paused:
                 return
-            time.sleep(0.01)
+            time.sleep(0.005)
         log.warning("step(%d) did not complete in time (at %s/%s)", steps, it, target)
 
     def status(self) -> SimStatus:
@@ -235,7 +277,19 @@ class GazeboEngine(SimulationEngine):
                              real_time=_t(s.real_time), real_time_factor=s.real_time_factor,
                              iterations=s.iterations, world=self.world)
 
+    def sim_time(self) -> float:
+        with self._lock:
+            return _t(self._stats.sim_time) if self._stats else 0.0
+
     # ------------------------------------------------------------------ callbacks (transport threads)
+    def _emit(self, name: str, sim_time: float, entities: list[str], data: dict[str, Any]) -> None:
+        cb = self._event_cb
+        if cb:
+            try:
+                cb((name, sim_time, entities, data))
+            except Exception:
+                log.exception("event callback failed")
+
     def _on_stats(self, msg) -> None:
         with self._lock:
             self._stats = msg
@@ -254,12 +308,29 @@ class GazeboEngine(SimulationEngine):
                 self._poses[name] = pose
                 self._dynamic.add(name)
                 changed[name] = pose
+            transitions = [self._update_grounded(io, sim_time) for io in self._agents.values()]
             cb = self._pose_cb
+        for tr in transitions:
+            if tr:
+                self._emit(*tr)
         if cb and changed:
             try:
                 cb(sim_time, changed)
-            except Exception:  # never let a consumer kill the transport thread
+            except Exception:
                 log.exception("pose callback failed")
+
+    def _update_grounded(self, io: _AgentIO, sim_time: float):
+        """Return an event tuple on landing/takeoff transition, else None. Caller holds lock."""
+        if io.last_ground_contact < 0:
+            return None
+        grounded = (sim_time - io.last_ground_contact) <= GROUND_CONTACT_TIMEOUT_S
+        prev = io.grounded
+        io.grounded = grounded
+        if prev is None or prev == grounded:
+            return None
+        pos = self._poses.get(io.id, Pose()).position
+        return ("landing" if grounded else "takeoff", sim_time, [io.id],
+                {"position": pos.model_dump()})
 
     def _make_odom_cb(self, io: _AgentIO):
         def cb(msg):
@@ -277,14 +348,60 @@ class GazeboEngine(SimulationEngine):
                 io.odom, io.odom_time = msg, t
         return cb
 
-    def _make_imu_cb(self, io: _AgentIO):
+    def _make_store_cb(self, io: _AgentIO, attr: str):
         def cb(msg):
             with self._lock:
-                io.imu = msg
+                setattr(io, attr, msg)
+        return cb
+
+    def _make_frame_cb(self, io: _AgentIO, sensor: str):
+        fmt_names = None
+
+        def cb(msg):
+            nonlocal fmt_names
+            if fmt_names is None:
+                fmt_names = msg.DESCRIPTOR.fields_by_name["pixel_format_type"].enum_type.values_by_number
+            with self._lock:
+                seq = io.seq.get(sensor, 0) + 1
+                io.seq[sensor] = seq
+                st = _t(msg.header.stamp) if msg.HasField("header") else self.sim_time()
+                io.frames[sensor] = RawFrame(bytes(msg.data), msg.width, msg.height,
+                                             fmt_names[msg.pixel_format_type].name, st, seq, time.monotonic())
+                io.rates.setdefault(sensor, _RateMeter()).tick()
+        return cb
+
+    def _make_contact_cb(self, io: _AgentIO):
+        def cb(msg):
+            events: list[EngineEvent] = []
+            with self._lock:
+                for c in msg.contact:
+                    t = _t(c.header.stamp) if c.HasField("header") else self.sim_time()
+                    n1, n2 = c.collision1.name, c.collision2.name
+                    other_coll = n2 if n1.startswith(io.id + "::") else n1
+                    other = other_coll.split("::")[0]
+                    pos = None
+                    if len(c.position):
+                        p = c.position[0]
+                        pos = {"x": p.x, "y": p.y, "z": p.z}
+                    if other.startswith(LANDING_SURFACES):
+                        io.last_ground_contact = t
+                        continue
+                    last = io.pair_last.get(other, -1e9)
+                    io.pair_last[other] = t
+                    if t - last > CONTACT_COOLDOWN_S:
+                        depth = float(c.depth[0]) if len(c.depth) else None
+                        events.append(("collision", t, [io.id, other],
+                                       {"position": pos, "collision": other_coll, "depth": depth,
+                                        "other_kind": self._kind(other)}))
+            for e in events:
+                self._emit(*e)
         return cb
 
     def on_pose_update(self, cb) -> None:
         self._pose_cb = cb
+
+    def on_event(self, cb) -> None:
+        self._event_cb = cb
 
     # ------------------------------------------------------------------ scene / entities
     async def _refresh_scene(self) -> None:
@@ -295,47 +412,57 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             self._scene_msg = scene
             self._model_ids = {m.id: m.name for m in scene.model}
-            # gz.msgs.Scene does not carry is_static; anything never published on
-            # dynamic_pose/info is static (SceneBroadcaster filters static models out).
-            self._static = {m.name for m in scene.model if m.is_static or m.name not in self._dynamic}
             for m in scene.model:
-                self._poses[m.name] = _pose_from_msg(m.pose)
+                self._poses.setdefault(m.name, _pose_from_msg(m.pose))
 
-    def _attach_agent(self, agent_id: str) -> None:
+    def _attach_agent(self, agent_id: str, camera: CameraSpec | None) -> None:
         g = self.tp.g
-        io = _AgentIO(agent_id)
+        io = _AgentIO(agent_id, camera)
         with self._lock:
             self._agents[agent_id] = io
+            self._kinds.setdefault(agent_id, "drone")
         self.tp.subscribe(g["Odometry"], f"/model/{agent_id}/odometry", self._make_odom_cb(io))
-        self.tp.subscribe(g["IMU"], f"/{agent_id}/imu", self._make_imu_cb(io))
+        self.tp.subscribe(g["IMU"], f"/{agent_id}/imu", self._make_store_cb(io, "imu"))
+        self.tp.subscribe(g["NavSat"], f"/{agent_id}/navsat", self._make_store_cb(io, "navsat"))
+        self.tp.subscribe(g["Contacts"], f"/{agent_id}/contacts", self._make_contact_cb(io))
+        if camera is not None and self.rendering:
+            self.tp.subscribe(g["Image"], f"/{agent_id}/camera", self._make_frame_cb(io, "camera"))
+            if camera.depth:
+                self.tp.subscribe(g["Image"], f"/{agent_id}/depth", self._make_frame_cb(io, "depth"))
         # Advertise command topics now: gz-transport drops messages published before
-        # discovery has connected publisher and subscriber, so a publisher created on the
-        # first action would lose that action (fatal in a step-locked control loop).
+        # discovery connects publisher and subscriber.
         self.tp.publisher(f"/{agent_id}/cmd/twist", g["Twist"])
         self.tp.publisher(f"/{agent_id}/cmd/enable", g["Boolean"])
 
-    def _kind(self, name: str):
-        if name in self._agents:
-            return "drone"
+    def _detach_agent(self, agent_id: str) -> None:
+        for t in (f"/model/{agent_id}/odometry", f"/{agent_id}/imu", f"/{agent_id}/navsat",
+                  f"/{agent_id}/contacts", f"/{agent_id}/camera", f"/{agent_id}/depth"):
+            self.tp.unsubscribe(t)
+        with self._lock:
+            self._agents.pop(agent_id, None)
+
+    def _kind(self, name: str) -> str:
+        k = self._kinds.get(name)
+        if k:
+            return k
         if name == "ground":
             return "static"
-        if name in self._static and name not in self._dynamic:
-            return "building" if any(k in name for k in ("tower", "block", "deck")) else "obstacle"
+        if name not in self._dynamic:
+            return "building" if any(s in name for s in ("tower", "block", "deck")) else "obstacle"
         return "dynamic"
 
     async def scene(self) -> SceneDesc:
         await self._refresh_scene()
         with self._lock:
             models = [self._convert_model(m) for m in self._scene_msg.model]
-        return SceneDesc(world=self.world, models=models)
+        return SceneDesc(world=self.world, models=models,
+                         bounds=self.scenario.world.bounds if self.scenario else None)
 
     def _convert_model(self, m) -> ModelDesc:
         links = []
         for l in m.link:
-            visuals = []
-            for v in l.visual:
-                visuals.append(Visual(name=v.name, pose=_pose_from_msg(v.pose) if v.HasField("pose") else Pose(),
-                                      geometry=_convert_geometry(v.geometry), color=_color(v)))
+            visuals = [Visual(name=v.name, pose=_pose_from_msg(v.pose) if v.HasField("pose") else Pose(),
+                              geometry=_convert_geometry(v.geometry), color=_color(v)) for v in l.visual]
             links.append(LinkDesc(name=l.name, pose=_pose_from_msg(l.pose) if l.HasField("pose") else Pose(),
                                   visuals=visuals))
         return ModelDesc(entity_id=m.name, kind=self._kind(m.name), is_agent=m.name in self._agents,
@@ -347,12 +474,16 @@ class GazeboEngine(SimulationEngine):
             return [EntityInfo(entity_id=n, kind=self._kind(n), is_agent=n in self._agents, pose=p)
                     for n, p in self._poses.items()]
 
+    def agent_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._agents)
+
     def entity_state(self, entity_id: str) -> EntityState | None:
         with self._lock:
             pose = self._poses.get(entity_id)
             if pose is None:
                 return None
-            sim_time = _t(self._stats.sim_time) if self._stats else 0.0
+            sim_time = self.sim_time()
             io = self._agents.get(entity_id)
             if io and io.odom is not None:
                 q = pose.orientation
@@ -362,6 +493,7 @@ class GazeboEngine(SimulationEngine):
                                    angular_velocity=ang, linear_acceleration=io.accel)
             return EntityState(entity_id=entity_id, sim_time=sim_time, pose=pose)
 
+    # ------------------------------------------------------------------ agent sensors
     def imu(self, agent_id: str) -> ImuReading | None:
         with self._lock:
             io = self._agents.get(agent_id)
@@ -374,37 +506,79 @@ class GazeboEngine(SimulationEngine):
                 orientation=Quat(x=m.orientation.x, y=m.orientation.y, z=m.orientation.z, w=m.orientation.w)
                 if m.HasField("orientation") else None)
 
+    def gps(self, agent_id: str) -> GpsReading | None:
+        with self._lock:
+            io = self._agents.get(agent_id)
+            if not io or io.navsat is None:
+                return None
+            m = io.navsat
+            return GpsReading(latitude_deg=m.latitude_deg, longitude_deg=m.longitude_deg, altitude=m.altitude,
+                              velocity_enu=Vec3(x=m.velocity_east, y=m.velocity_north, z=m.velocity_up))
+
+    def body_velocity(self, agent_id: str):
+        with self._lock:
+            io = self._agents.get(agent_id)
+            if not io or io.odom is None:
+                return None
+            tw = io.odom.twist
+            return (Vec3(x=tw.linear.x, y=tw.linear.y, z=tw.linear.z),
+                    Vec3(x=tw.angular.x, y=tw.angular.y, z=tw.angular.z))
+
+    def grounded(self, agent_id: str) -> bool | None:
+        with self._lock:
+            io = self._agents.get(agent_id)
+            return io.grounded if io else None
+
     def sensor_names(self, agent_id: str) -> list[str]:
-        names = ["imu", "navsat"]
-        if self.rendering:
-            names += ["camera", "depth"]
-        return names
+        with self._lock:
+            io = self._agents.get(agent_id)
+            names = ["imu", "navsat", "contact"]
+            if io and io.camera and self.rendering:
+                names.append("camera")
+                if io.camera.depth:
+                    names.append("depth")
+            return names
 
-    def sensor_frame(self, agent_id: str, sensor: str):
-        return None  # image sensors land in the next slice
+    def frame(self, agent_id: str, sensor: str) -> RawFrame | None:
+        with self._lock:
+            io = self._agents.get(agent_id)
+            return io.frames.get(sensor) if io else None
 
-    # ------------------------------------------------------------------ spawn / remove / actions
-    async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict) -> None:
+    def sensor_rate(self, agent_id: str, sensor: str) -> float:
+        with self._lock:
+            io = self._agents.get(agent_id)
+            m = io.rates.get(sensor) if io else None
+            return m.rate if m else 0.0
+
+    # ------------------------------------------------------------------ spawn / remove / set_pose
+    def _fill_pose(self, msg, pose: Pose) -> None:
+        msg.position.x, msg.position.y, msg.position.z = pose.position.x, pose.position.y, pose.position.z
+        q = pose.orientation
+        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = q.x, q.y, q.z, q.w
+
+    async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict, *, camera=None) -> bool:
         g = self.tp.g
         tpl = sdfgen.TEMPLATES.get(template)
         if tpl is None:
             raise ValueError(f"unknown template {template!r}; known: {list(sdfgen.TEMPLATES)}")
+        is_agent = template in sdfgen.AGENT_TEMPLATES
+        if is_agent and camera is not None and not self.rendering:
+            log.warning("spawn %s: cameras requested but the world has no Sensors system; ignoring", entity_id)
+            camera = None
         req = g["EntityFactory"]()
-        req.sdf = tpl(entity_id, params, rendering=self.rendering)
+        req.sdf = tpl(entity_id, params, camera=camera) if is_agent else tpl(entity_id, params)
         req.name = entity_id
         req.allow_renaming = False
-        req.pose.position.x, req.pose.position.y, req.pose.position.z = pose.position.x, pose.position.y, pose.position.z
-        q = pose.orientation
-        req.pose.orientation.x, req.pose.orientation.y, req.pose.orientation.z, req.pose.orientation.w = q.x, q.y, q.z, q.w
+        self._fill_pose(req.pose, pose)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/create", req, g["Boolean"]))
-        await asyncio.sleep(0.3)  # creation is processed on the next sim iteration
+        await asyncio.sleep(0.3)
         await self._refresh_scene()
-        if template in sdfgen.TEMPLATES and entity_id in self._model_ids.values():
-            self._attach_agent(entity_id)
-        if self.scenario is not None:
-            from ...scenario import AgentSpec
-            self.scenario.agents.append(AgentSpec(id=entity_id, template=template, spawn=pose, params=params))
+        with self._lock:
+            self._kinds[entity_id] = "drone" if is_agent else ("vehicle" if template == "vehicle" else "target")
+        if is_agent and entity_id in self._model_ids.values():
+            self._attach_agent(entity_id, camera)
+        return is_agent
 
     async def remove(self, entity_id: str) -> None:
         g = self.tp.g
@@ -413,27 +587,47 @@ class GazeboEngine(SimulationEngine):
         req.type = g["Entity"].MODEL
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/remove", req, g["Boolean"]))
+        if entity_id in self._agents:
+            self._detach_agent(entity_id)
         with self._lock:
-            self._agents.pop(entity_id, None)
             self._poses.pop(entity_id, None)
-        self.tp.unsubscribe(f"/model/{entity_id}/odometry")
-        self.tp.unsubscribe(f"/{entity_id}/imu")
+            self._kinds.pop(entity_id, None)
         await asyncio.sleep(0.3)
         await self._refresh_scene()
 
-    async def send_action(self, agent_id: str, action: Action) -> None:
+    def set_pose(self, entity_id: str, pose: Pose) -> None:
         g = self.tp.g
-        if isinstance(action, VelocityAction):
-            msg = g["Twist"]()
-            msg.linear.x, msg.linear.y, msg.linear.z = action.vx, action.vy, action.vz
-            msg.angular.z = action.yaw_rate
-            self.tp.publish(f"/{agent_id}/cmd/twist", msg)
-        elif isinstance(action, ArmAction):
-            msg = g["Boolean"]()
-            msg.data = action.armed
-            self.tp.publish(f"/{agent_id}/cmd/enable", msg)
-        else:
-            raise ValueError(f"unsupported action {action!r}")
+        msg = g["Pose"]()
+        msg.name = entity_id
+        self._fill_pose(msg, pose)
+        # non-blocking variant: enqueued, applied on the next iteration
+        try:
+            self.tp.request(f"/world/{self.world}/set_pose", msg, g["Boolean"], 500)
+        except TimeoutError:
+            log.debug("set_pose timed out for %s", entity_id)
+
+    # ------------------------------------------------------------------ actions
+    def send_velocity(self, agent_id: str, action: VelocityAction) -> None:
+        g = self.tp.g
+        vx, vy, vz = action.vx, action.vy, action.vz
+        if action.frame == "world":
+            with self._lock:
+                pose = self._poses.get(agent_id)
+            if pose is not None:
+                q = pose.orientation
+                inv = Quat(x=-q.x, y=-q.y, z=-q.z, w=q.w)
+                v = _rotate(inv, Vec3(x=vx, y=vy, z=vz))
+                vx, vy, vz = v.x, v.y, v.z
+        msg = g["Twist"]()
+        msg.linear.x, msg.linear.y, msg.linear.z = vx, vy, vz
+        msg.angular.z = action.yaw_rate
+        self.tp.publish(f"/{agent_id}/cmd/twist", msg)
+
+    def send_arm(self, agent_id: str, armed: bool) -> None:
+        g = self.tp.g
+        msg = g["Boolean"]()
+        msg.data = armed
+        self.tp.publish(f"/{agent_id}/cmd/enable", msg)
 
 
 # ---------------------------------------------------------------------- helpers

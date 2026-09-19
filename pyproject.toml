@@ -12,6 +12,7 @@ dependencies = [
   "websockets>=12",
   "numpy>=1.26",
   "protobuf>=7.36.1,<8",  # must be >= protoc used by Homebrew gz-msgs12
+  "pillow>=10",
 ]
 
 [project.optional-dependencies]

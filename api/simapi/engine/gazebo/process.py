@@ -28,7 +28,9 @@ class GazeboProcess:
         if run:
             cmd.append("-r")
         if rendering:
-            cmd += ["--render-engine-server", "ogre2"]
+            # --headless-rendering initialises ogre2 without a window; verified to work on
+            # macOS (Metal) as well as Linux (EGL). Without it, init takes ~6 s on macOS.
+            cmd += ["--headless-rendering", "--render-engine-server", "ogre2"]
         cmd.append(str(world_file))
 
         env = os.environ.copy()

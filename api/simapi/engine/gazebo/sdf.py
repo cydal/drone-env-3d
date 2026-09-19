@@ -1,31 +1,34 @@
 """SDF generation: world template + entity templates.
 
-Physical parameters of the quadcopter template are taken from the X3 UAV
-model that ships with gz-sim's multicopter_velocity_control example world
-(1.5 kg airframe, 4 rotors) so that the MulticopterVelocityControl gains are
-known to be stable. Visuals are primitives so the browser needs no mesh
-loading for the vertical slice.
+Physical parameters of the quadcopter template are taken from the X3 UAV model
+that ships with gz-sim's multicopter_velocity_control example world (1.5 kg
+airframe, 4 rotors) so the MulticopterVelocityControl gains are known-stable.
+Visuals are primitives so the browser needs no mesh loading.
 """
 from __future__ import annotations
 
+import math
 from xml.sax.saxutils import escape
 
 from ...models import Pose
-from ...scenario import Scenario
+from ...scenario import AgentSpec, CameraSpec, EntitySpec, Scenario
 
 
 def pose_str(p: Pose) -> str:
-    import math
     x, y, z, w = p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w
-    # quaternion -> roll pitch yaw
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
     pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
     return f"{p.position.x} {p.position.y} {p.position.z} {roll} {pitch} {yaw}"
 
 
+def _material(rgba: str) -> str:
+    return (f"<material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse>"
+            f"<specular>0.2 0.2 0.2 1</specular></material>")
+
+
 # ---------------------------------------------------------------------------
-# Quadcopter template
+# Quadcopter agent template
 # ---------------------------------------------------------------------------
 
 _ROTORS = [
@@ -39,25 +42,44 @@ MOTOR_CONSTANT = 8.54858e-06
 MOMENT_CONSTANT = 0.016
 
 
-def _material(rgba: str) -> str:
-    return f"<material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse><specular>0.2 0.2 0.2 1</specular></material>"
+def _camera_sensors(ns: str, cam: CameraSpec) -> str:
+    pose = " ".join(str(v) for v in cam.pose)
+    out = f"""
+      <sensor name="camera" type="camera">
+        <pose>{pose}</pose>
+        <topic>/{ns}/camera</topic>
+        <update_rate>{cam.update_rate}</update_rate>
+        <camera>
+          <horizontal_fov>{cam.hfov}</horizontal_fov>
+          <image><width>{cam.width}</width><height>{cam.height}</height><format>RGB_INT8</format></image>
+          <clip><near>0.05</near><far>300</far></clip>
+        </camera>
+        <always_on>1</always_on>
+      </sensor>"""
+    if cam.depth:
+        out += f"""
+      <sensor name="depth" type="depth_camera">
+        <pose>{pose}</pose>
+        <topic>/{ns}/depth</topic>
+        <update_rate>{cam.update_rate}</update_rate>
+        <camera>
+          <horizontal_fov>{cam.hfov}</horizontal_fov>
+          <image><width>{cam.width}</width><height>{cam.height}</height><format>R_FLOAT32</format></image>
+          <clip><near>0.1</near><far>100</far></clip>
+        </camera>
+        <always_on>1</always_on>
+      </sensor>"""
+    return out
 
 
-def quadcopter_sdf(entity_id: str, params: dict | None = None, *, rendering: bool = False,
+def quadcopter_sdf(entity_id: str, params: dict | None = None, *, camera: CameraSpec | None = None,
                    wrap_in_sdf: bool = True) -> str:
     """Return the <model> (optionally wrapped in <sdf>) for a quadcopter agent."""
     params = params or {}
     ns = entity_id
     color = params.get("color", "0.95 0.45 0.10 1")
-    cam = params.get("camera", {})
-    cam_w, cam_h = cam.get("width", 320), cam.get("height", 240)
-    cam_fov = cam.get("hfov", 1.396)
-    cam_hz = cam.get("update_rate", 15)
 
-    rotors_links = []
-    rotors_joints = []
-    motor_plugins = []
-    rotor_cfg = []
+    rotors_links, rotors_joints, motor_plugins, rotor_cfg = [], [], [], []
     for name, (x, y, z), turning, direction in _ROTORS:
         rotors_links.append(f"""
     <link name="{name}">
@@ -111,9 +133,8 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, rendering: boo
           <direction>{direction}</direction>
         </rotor>""")
 
-    # arms: two diagonal bars
     arms = ""
-    for i, yaw in enumerate((0.9828, -0.9828)):  # atan2(0.22,0.13)
+    for i, yaw in enumerate((0.9828, -0.9828)):  # atan2(0.22, 0.13)
         arms += f"""
       <visual name="arm_{i}">
         <pose>0 0 0.01 0 0 {yaw}</pose>
@@ -121,31 +142,7 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, rendering: boo
         {_material("0.25 0.25 0.28 1")}
       </visual>"""
 
-    camera_sensors = ""
-    if rendering:
-        camera_sensors = f"""
-      <sensor name="camera" type="camera">
-        <pose>0.12 0 -0.02 0 0.35 0</pose>
-        <topic>/{ns}/camera</topic>
-        <update_rate>{cam_hz}</update_rate>
-        <camera>
-          <horizontal_fov>{cam_fov}</horizontal_fov>
-          <image><width>{cam_w}</width><height>{cam_h}</height><format>RGB_INT8</format></image>
-          <clip><near>0.05</near><far>300</far></clip>
-        </camera>
-        <always_on>1</always_on>
-      </sensor>
-      <sensor name="depth" type="depth_camera">
-        <pose>0.12 0 -0.02 0 0.35 0</pose>
-        <topic>/{ns}/depth</topic>
-        <update_rate>{cam_hz}</update_rate>
-        <camera>
-          <horizontal_fov>{cam_fov}</horizontal_fov>
-          <image><width>{cam_w}</width><height>{cam_h}</height><format>R_FLOAT32</format></image>
-          <clip><near>0.1</near><far>100</far></clip>
-        </camera>
-        <always_on>1</always_on>
-      </sensor>"""
+    cameras = _camera_sensors(ns, camera) if camera else ""
 
     model = f"""
   <model name="{escape(entity_id)}">
@@ -176,7 +173,15 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, rendering: boo
         <topic>/{ns}/navsat</topic>
         <update_rate>10</update_rate>
         <always_on>1</always_on>
-      </sensor>{camera_sensors}
+      </sensor>
+      <sensor name="contact" type="contact">
+        <contact>
+          <collision>base_collision</collision>
+          <topic>/{ns}/contacts</topic>
+        </contact>
+        <update_rate>50</update_rate>
+        <always_on>1</always_on>
+      </sensor>{cameras}
     </link>
     {''.join(rotors_links)}
     {''.join(rotors_joints)}
@@ -203,15 +208,77 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, rendering: boo
     return model
 
 
-TEMPLATES = {"quadcopter": quadcopter_sdf}
+# ---------------------------------------------------------------------------
+# Environment-controlled (kinematic) entity templates
+# ---------------------------------------------------------------------------
+
+def target_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool = True, **_) -> str:
+    """A floating marker sphere. Gravity off; moved kinematically by the environment."""
+    params = params or {}
+    r = float(params.get("radius", 0.5))
+    color = params.get("color", "1.0 0.2 0.2 1")
+    model = f"""
+  <model name="{escape(entity_id)}">
+    <link name="link">
+      <gravity>false</gravity>
+      <inertial><mass>1</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz></inertia></inertial>
+      <collision name="collision"><geometry><sphere><radius>{r}</radius></sphere></geometry></collision>
+      <visual name="visual"><geometry><sphere><radius>{r}</radius></sphere></geometry>{_material(color)}</visual>
+      <visual name="ring">
+        <geometry><cylinder><radius>{r * 1.6}</radius><length>0.03</length></cylinder></geometry>
+        {_material("1 1 1 0.6")}
+      </visual>
+    </link>
+  </model>"""
+    return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
+
+
+def vehicle_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool = True, **_) -> str:
+    """A ground vehicle body (box + wheels). Gravity off; moved kinematically."""
+    params = params or {}
+    color = params.get("color", "0.2 0.55 0.95 1")
+    L, W, H = 4.2, 1.9, 1.3
+    wheels = ""
+    for i, (x, y) in enumerate(((1.4, 1.0), (1.4, -1.0), (-1.4, 1.0), (-1.4, -1.0))):
+        wheels += f"""
+      <visual name="wheel_{i}">
+        <pose>{x} {y} -0.35 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.38</radius><length>0.3</length></cylinder></geometry>
+        {_material("0.08 0.08 0.08 1")}
+      </visual>"""
+    model = f"""
+  <model name="{escape(entity_id)}">
+    <link name="link">
+      <gravity>false</gravity>
+      <inertial><mass>1500</mass><inertia><ixx>800</ixx><iyy>2500</iyy><izz>2800</izz></inertia></inertial>
+      <collision name="collision"><geometry><box><size>{L} {W} {H}</size></box></geometry></collision>
+      <visual name="body"><geometry><box><size>{L} {W} {H * 0.55}</size></box></geometry>{_material(color)}</visual>
+      <visual name="cabin">
+        <pose>-0.3 0 {H * 0.45} 0 0 0</pose>
+        <geometry><box><size>{L * 0.5} {W * 0.9} {H * 0.45}</size></box></geometry>
+        {_material("0.15 0.18 0.22 1")}
+      </visual>{wheels}
+    </link>
+  </model>"""
+    return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
+
+
+AGENT_TEMPLATES = {"quadcopter": quadcopter_sdf}
+ENTITY_TEMPLATES = {"target": target_sdf, "vehicle": vehicle_sdf}
+TEMPLATES = {**AGENT_TEMPLATES, **ENTITY_TEMPLATES}
+
+
+def _with_pose(model: str, pose: Pose) -> str:
+    head, sep, tail = model.partition(">")
+    return f"{head}{sep}\n    <pose>{pose_str(pose)}</pose>{tail}"
 
 
 # ---------------------------------------------------------------------------
 # World assembly: base world file + scenario -> concrete SDF
 # ---------------------------------------------------------------------------
 
-def build_world_sdf(base_world_sdf: str, scenario: Scenario, *, rendering: bool = False) -> str:
-    """Inject physics settings and agent models into a base world file.
+def build_world_sdf(base_world_sdf: str, scenario: Scenario) -> str:
+    """Inject physics/system plugins, agents and dynamic entities into a base world.
 
     The base world must contain the marker comments
     ``<!-- @physics -->`` and ``<!-- @agents -->``.
@@ -229,26 +296,26 @@ def build_world_sdf(base_world_sdf: str, scenario: Scenario, *, rendering: bool 
     </plugin>
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
     <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
-    <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>"""
-    if rendering:
+    <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>"""
+    if scenario.rendering:
         physics += """
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>"""
-    if scenario.environment.wind is not None:
-        w = scenario.environment.wind
+    w = scenario.environment.wind
+    if w is not None and (w.x or w.y or w.z):
         physics += f"""
     <wind><linear_velocity>{w.x} {w.y} {w.z}</linear_velocity></wind>"""
 
-    agents = []
+    models = []
     for a in scenario.agents:
-        tpl = TEMPLATES[a.template]
-        model = tpl(a.id, a.params, rendering=rendering, wrap_in_sdf=False)
-        # insert spawn pose right after <model name="...">
-        head, sep, tail = model.partition(">")
-        model = f"{head}{sep}\n    <pose>{pose_str(a.spawn)}</pose>{tail}"
-        agents.append(model)
+        tpl = AGENT_TEMPLATES[a.template]
+        models.append(_with_pose(tpl(a.id, a.params, camera=a.camera, wrap_in_sdf=False), a.spawn))
+    for e in scenario.entities:
+        tpl = ENTITY_TEMPLATES[e.template]
+        models.append(_with_pose(tpl(e.id, e.params, wrap_in_sdf=False), e.spawn))
 
     out = base_world_sdf.replace("<!-- @physics -->", physics)
-    out = out.replace("<!-- @agents -->", "\n".join(agents))
+    out = out.replace("<!-- @agents -->", "\n".join(models))
     return out
