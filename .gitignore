@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+web/dist/
+runs/
+.gz/
+*.log
+.DS_Store
+briefs/
