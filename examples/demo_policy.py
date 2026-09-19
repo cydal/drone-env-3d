@@ -29,9 +29,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7); ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8000)
     a = ap.parse_args()
     sim = Simulation(a.host, a.port, timeout=120)
-    cfg = TaskConfig(level=a.level, observation=a.observation, seed=1)
-    task = NavigationTask(sim, cfg, overlay=True)
     policy = make_policy(a.policy)
+    scale = getattr(policy, "obs_scale", None)
+    k = (len(scale) - 12) // 4 if scale is not None else 0
+    cfg = TaskConfig(level=a.level, observation=a.observation, seed=1, obstacle_features=k)
+    task = NavigationTask(sim, cfg, overlay=True)
     step_dt = cfg.action_repeat * 0.004
     for ep in range(a.episodes):
         obs, info = task.reset(seed=a.seed + ep)

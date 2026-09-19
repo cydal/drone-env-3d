@@ -24,16 +24,21 @@ from .policies import SB3Policy, WaypointPolicy, RandomPolicy
 from .task import TaskConfig
 
 EVALSET_FOR_LEVEL = {"open": "level1_open_eval", "pillars": "level2_pillars_eval", "city": "level3_city_eval"}
-OBS_SCALE = np.array([20, 20, 10, 5, 5, 5, 1, 1, 10, 30, 1, 1], dtype=np.float32)
+OBS_SCALE = np.array([20, 20, 10, 5, 5, 5, 1, 1, 10, 30, 1, 1], dtype=np.float32)   # 12-d base layout
+
+
+def obs_scale_for(cfg: TaskConfig) -> np.ndarray:
+    return np.array(OBS_SCALE.tolist() + [20, 20, 5, 10] * cfg.obstacle_features, dtype=np.float32)
 
 
 def make_env_fn(cfg: TaskConfig, port: int, seed: int):
     def _f():
         import gymnasium as gym
         from stable_baselines3.common.monitor import Monitor
+        scale = obs_scale_for(cfg)
         env = NavigationGymEnv(cfg, port=port)
-        env = gym.wrappers.TransformObservation(env, lambda o: (o / OBS_SCALE).astype(np.float32),
-                                                gym.spaces.Box(-np.inf, np.inf, (12,), np.float32))
+        env = gym.wrappers.TransformObservation(env, lambda o: (o / scale).astype(np.float32),
+                                                gym.spaces.Box(-np.inf, np.inf, (len(scale),), np.float32))
         env = Monitor(env)               # logs ep_rew_mean / ep_len_mean to tensorboard + stdout
         env.reset(seed=seed)
         return env
@@ -42,9 +47,9 @@ def make_env_fn(cfg: TaskConfig, port: int, seed: int):
 
 class ScaledPolicy:
     """Adapter so the evaluator (raw observations) can drive the SB3 model (scaled observations)."""
-    def __init__(self, inner: SB3Policy, name: str) -> None:
-        self.inner, self.name = inner, name
-    def __call__(self, obs): return self.inner(obs / OBS_SCALE)
+    def __init__(self, inner: SB3Policy, name: str, scale=None) -> None:
+        self.inner, self.name, self.scale = inner, name, (OBS_SCALE if scale is None else scale)
+    def __call__(self, obs): return self.inner(obs / self.scale)
     def reset(self): pass
 
 
@@ -60,6 +65,8 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=0.98); ap.add_argument("--log-std-init", type=float, default=-0.5,
                     help="initial action noise: std = exp(x) in normalised action units (default 0.6 -> 1.8 m/s)")
     ap.add_argument("--resume", default=None, help="continue training from this model.zip (new experiment dir)")
+    ap.add_argument("--obstacle-features", type=int, default=None,
+                    help="K nearest obstacles in the observation (default: 0 for open, 3 otherwise)")
     ap.add_argument("--lr-decay", action="store_true", help="linear learning-rate decay to 0 over the run")
     a = ap.parse_args()
 
@@ -69,11 +76,13 @@ def main() -> int:
     import torch
     torch.set_num_threads(2)
 
-    cfg = TaskConfig(level=a.level, observation=a.observation, max_steps=a.max_steps, seed=1)
+    k = a.obstacle_features if a.obstacle_features is not None else (0 if a.level == "open" else 3)
+    cfg = TaskConfig(level=a.level, observation=a.observation, max_steps=a.max_steps, seed=1, obstacle_features=k)
+    scale = obs_scale_for(cfg)
     name = a.name or f"ppo_{a.level}_{a.observation}"
     exp = Experiment(name, {
         "algorithm": "PPO (stable-baselines3)", "task": cfg.to_json(), "observation_profile": a.observation,
-        "action_space": "Box(-1,1)^3 -> world-frame velocity * max_speed", "obs_scale": OBS_SCALE.tolist(),
+        "action_space": "Box(-1,1)^3 -> world-frame velocity * max_speed", "obs_scale": scale.tolist(),
         "reward": cfg.reward.__dict__, "n_envs": a.n_envs, "total_steps": a.steps, "seed": a.seed,
         "ppo": {"learning_rate": a.lr, "n_steps": a.n_steps, "batch_size": a.batch_size, "ent_coef": a.ent_coef,
                 "gamma": a.gamma, "gae_lambda": 0.95, "policy": "MlpPolicy [64,64]", "log_std_init": a.log_std_init},
@@ -108,7 +117,7 @@ def main() -> int:
                 # pause training envs' use of sim 0 is not possible while SubprocVecEnv holds it; use a
                 # dedicated extra simulator for evaluation instead.
                 from simclient import Simulation
-                pol = ScaledPolicy(SB3Policy(self.model, deterministic=True), name=f"{name}@{self.num_timesteps}")
+                pol = ScaledPolicy(SB3Policy(self.model, deterministic=True), name=f"{name}@{self.num_timesteps}", scale=scale)
                 s = run_eval(pol, cfg, evalset_small, sim=Simulation(port=eval_pool.ports[0], timeout=120),
                              out_dir=exp.path("evals", f"step_{self.num_timesteps:08d}"), verbose=False)
                 self.history.append({"timesteps": self.num_timesteps, **{k: s[k] for k in ("success_rate", "collision_rate", "mean_final_distance_m", "mean_return", "mean_time_to_target_s")}})
@@ -129,7 +138,7 @@ def main() -> int:
             # final evaluation on the full fixed set, alongside the baselines for context
             from simclient import Simulation
             sim = Simulation(port=eval_pool.ports[0], timeout=120)
-            final = run_eval(ScaledPolicy(SB3Policy(model), name=name), cfg, evalset, sim=sim,
+            final = run_eval(ScaledPolicy(SB3Policy(model), name=name, scale=scale), cfg, evalset, sim=sim,
                              out_dir=exp.path("evals", "final"), record=True, verbose=True)
             exp.log_result("final_eval", {k: v for k, v in final.items() if k != "task_config"})
             for base in (WaypointPolicy(), RandomPolicy(a.seed)):

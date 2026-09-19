@@ -51,7 +51,10 @@ def test_reward_and_events_flow_from_simulator_to_task(sim):
     obs, _ = task.reset(seed=3)
     d0 = float(obs[9])
     obs, r, term, trunc, info = task.step(WaypointPolicy()(obs))
-    assert info["distance"] < d0 and r > -0.1          # progress reward dominates
+    rc = task.cfg.reward
+    # progress term positive; the dense distance penalty (0.02 * ~22 m) dominates the first step by design
+    assert info["distance"] < d0
+    assert r > -(rc.distance_penalty * d0 + rc.time_penalty + 3 * rc.action_penalty) - 1e-6
     assert info["events"] == [] and not term and not trunc
     # reached event comes from the task (distance), termination flags follow
     res = _run(task, WaypointPolicy(), seed=3)

@@ -107,10 +107,15 @@ def main() -> int:
     ap.add_argument("--record", action="store_true", help="also save .npz trajectories")
     ap.add_argument("--overlay", action="store_true", help="push task overlay to the browser")
     ap.add_argument("--max-steps", type=int, default=200)
+    ap.add_argument("--obstacle-features", type=int, default=None, help="K nearest obstacles in the observation (default: from the model's experiment.json, else 0)")
     a = ap.parse_args()
     es = load_evalset(a.evalset); es["name"] = a.evalset
-    cfg = TaskConfig(level=es["level"], observation=a.observation, max_steps=a.max_steps, seed=1)
     policy = make_policy(a.policy)
+    k = a.obstacle_features
+    if k is None:
+        scale = getattr(policy, "obs_scale", None)
+        k = (len(scale) - 12) // 4 if scale is not None else 0
+    cfg = TaskConfig(level=es["level"], observation=a.observation, max_steps=a.max_steps, seed=1, obstacle_features=k)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(a.out) if a.out else EXPERIMENTS / f"eval_{policy.name}_{a.evalset}_{stamp}"
     sim = Simulation(a.host, a.port, timeout=120)

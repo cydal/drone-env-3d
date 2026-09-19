@@ -80,6 +80,8 @@ class TaskConfig:
     target: Region | None = None
     seed: int | None = None        # simulator seed (fixed per experiment); episode RNG is separate
     fixed_pairs: list[dict[str, Any]] | None = None   # evaluation: explicit [{start, target}, ...]
+    obstacle_features: int = 0     # K nearest static obstacles appended to the observation (privileged
+                                   #   state for Level 2+: dx, dy, radius, top-height-relative per obstacle)
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -128,8 +130,9 @@ class NavigationTask:
         self._episode_idx = -1
         self._loaded = False
         self.limits = (4.0, 2.0)
-        self.obs_dim = 12
+        self.obs_dim = 12 + 4 * cfg.obstacle_features
         self.act_dim = 3
+        self._obstacles: list[tuple[float, float, float, float]] = []   # (x, y, radius, top_z) of static obstacles
         self._reset_state()
 
     # ---- public --------------------------------------------------------------
@@ -231,9 +234,10 @@ class NavigationTask:
         return obs, float(reward), terminated, truncated, info
 
     def observation_space_info(self) -> dict[str, Any]:
-        return {"dim": self.obs_dim, "layout": ["rel_target_xyz(3)", "vel_world_xyz(3)", "heading_sin_cos(2)",
-                                                 "altitude(1)", "distance(1)", "target_dir_body_xy(2)"],
-                "profile": self.cfg.observation}
+        layout = ["rel_target_xyz(3)", "vel_world_xyz(3)", "heading_sin_cos(2)", "altitude(1)", "distance(1)", "target_dir_body_xy(2)"]
+        if self.cfg.obstacle_features:
+            layout.append(f"nearest_obstacles[{self.cfg.obstacle_features}](dx, dy, radius, top_rel)")
+        return {"dim": self.obs_dim, "layout": layout, "profile": self.cfg.observation}
 
     # ---- internals -------------------------------------------------------------
     @property
@@ -257,7 +261,44 @@ class NavigationTask:
             raise RuntimeError(f"scenario {self.scenario_name} lacks gps; navigation/vision modes need it")
         lim = self.sim.agent(AGENT)["action_space"]["limits"]
         self.limits = (float(lim["max_speed_xy"]), float(lim["max_speed_z"]))
+        self._obstacles = self._load_obstacles() if self.cfg.obstacle_features else []
         self._loaded = True
+
+    def _load_obstacles(self) -> list[tuple[float, float, float, float]]:
+        """Static obstacles from the scene description: (x, y, equivalent radius, top z).
+        Privileged information, used only by the `obstacle_features` observation extension."""
+        out = []
+        for m in self.sim._get("/scene")["models"]:
+            if not m["is_static"] or m["entity_id"] == "ground" or m["kind"] not in ("building", "obstacle"):
+                continue
+            px, py, pz = m["pose"]["position"]["x"], m["pose"]["position"]["y"], m["pose"]["position"]["z"]
+            r, top = 0.0, pz
+            for link in m["links"]:
+                for v in link["visuals"]:
+                    g = v["geometry"]
+                    if g["type"] == "cylinder":
+                        r = max(r, g["radius"]); top = max(top, pz + g["length"] / 2)
+                    elif g["type"] == "box":
+                        r = max(r, math.hypot(g["size"]["x"], g["size"]["y"]) / 2); top = max(top, pz + g["size"]["z"] / 2)
+            if top - pz < 0.5:            # landing pads and other flat things are not obstacles
+                continue
+            out.append((px, py, r, top))
+        return out
+
+    def _obstacle_vector(self, pos) -> list[float]:
+        """K nearest obstacles as (dx, dy, radius, top_z - drone_z); far sentinel when fewer exist."""
+        K = self.cfg.obstacle_features
+        items = sorted(self._obstacles, key=lambda o: math.hypot(o[0] - pos[0], o[1] - pos[1]) - o[2])[:K]
+        feats: list[float] = []
+        for (ox, oy, r, top) in items:
+            feats += [ox - pos[0], oy - pos[1], r, top - pos[2]]
+        while len(feats) < 4 * K:
+            feats += [50.0, 50.0, 0.0, -50.0]
+        return feats
+
+    def obs_scale(self) -> np.ndarray:
+        base = [20, 20, 10, 5, 5, 5, 1, 1, 10, 30, 1, 1]
+        return np.array(base + [20, 20, 5, 10] * self.cfg.obstacle_features, dtype=np.float32)
 
     def _reset_state(self) -> None:
         self.steps = 0
@@ -301,7 +342,10 @@ class NavigationTask:
         dist = math.sqrt(sum(r * r for r in rel))
         c, s_ = math.cos(yaw), math.sin(yaw)
         body_dir = ((c * rel[0] + s_ * rel[1]) / max(dist, 1e-6), (-s_ * rel[0] + c * rel[1]) / max(dist, 1e-6))
-        vec = np.array([*rel, *vel, math.sin(yaw), math.cos(yaw), pos[2], dist, *body_dir], dtype=np.float32)
+        parts = [*rel, *vel, math.sin(yaw), math.cos(yaw), pos[2], dist, *body_dir]
+        if self.cfg.obstacle_features:
+            parts += self._obstacle_vector(pos)
+        vec = np.array(parts, dtype=np.float32)
         st_like = {"sim_time": o["sim_time"], "pos": pos, "vel": vel, "yaw": yaw, "raw": o}
         return vec, st_like
 
