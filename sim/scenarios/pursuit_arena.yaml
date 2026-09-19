@@ -1,0 +1,31 @@
+name: pursuit_arena
+description: A controllable drone and a deterministic moving target over the open field (physical setup for future pursuit experiments; no intelligence here).
+world:
+  name: autonomous_city
+  file: autonomous_city.sdf
+  bounds: {x: [-160, 160], y: [-140, 170], z: [-1, 90]}
+  areas:
+    - {name: operations, x: [-50, 50], y: [-100, -30]}
+    - {name: urban, x: [20, 90], y: [0, 70]}
+    - {name: industrial, x: [-125, -10], y: [-10, 100]}
+    - {name: open_field, x: [35, 145], y: [-130, -45]}
+    - {name: hill, x: [-95, -25], y: [85, 155]}
+agents:
+  - {id: drone_01, template: quadcopter, drone_type: light, spawn: {position: {x: 60.0, y: -70.0, z: 0.25}}, observation: shared, control: velocity}
+entities:
+  - id: target_01
+    template: target
+    spawn: {position: {x: 100.0, y: -70.0, z: 10.0}}
+    trajectory: {type: circle, center: {x: 90, y: -70, z: 10}, radius: 20.0, speed: 4.0}
+    params: {radius: 0.8, color: "1.0 0.2 0.2 1"}
+randomize:
+  entities:
+    target_01:
+      routes:
+        - {type: circle, center: {x: 90, y: -70, z: 10}, radius: 20.0, speed: 4.0}
+        - {type: waypoints, speed: 5.0, loop: true, waypoints: [{x: 60, y: -90, z: 8}, {x: 120, y: -90, z: 14}, {x: 120, y: -50, z: 8}, {x: 60, y: -50, z: 14}]}
+        - {type: line, start: {x: 50, y: -70, z: 9}, end: {x: 130, y: -70, z: 9}, speed: 6.0, loop: true}
+  agents:
+    drone_01: {region: {x: [50, 130], y: [-95, -45], z: [0.25, 0.25]}, yaw: true}
+environment: {time_of_day: day}
+simulation: {step_size: 0.004, real_time_factor: 0.0, seed: 61, start_paused: true, mode: stepped}

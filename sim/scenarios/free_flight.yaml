@@ -1,0 +1,24 @@
+name: free_flight
+description: Open environment for flight tests. One standard drone on pad bravo; whole city available.
+world:
+  name: autonomous_city
+  file: autonomous_city.sdf
+  bounds: {x: [-160, 160], y: [-140, 170], z: [-1, 90]}
+  areas:
+    - {name: operations, x: [-50, 50], y: [-100, -30]}
+    - {name: urban, x: [20, 90], y: [0, 70]}
+    - {name: industrial, x: [-125, -10], y: [-10, 100]}
+    - {name: open_field, x: [35, 145], y: [-130, -45]}
+    - {name: hill, x: [-95, -25], y: [85, 155]}
+agents:
+  - id: drone_01
+    template: quadcopter
+    drone_type: standard
+    spawn: {position: {x: 0.0, y: -55.0, z: 0.25}}
+    observation: state
+    control: waypoint
+    sensors:
+      - {name: front_cam, type: camera, pose: [0.12, 0, -0.02, 0, 0.35, 0], params: {width: 320, height: 240, hfov: 1.4, update_rate: 10}}
+      - {name: front_depth, type: depth, pose: [0.12, 0, -0.02, 0, 0.35, 0], params: {width: 320, height: 240, hfov: 1.4, update_rate: 10}}
+environment: {time_of_day: day}
+simulation: {step_size: 0.004, real_time_factor: 1.0, seed: 1, start_paused: false, mode: realtime}

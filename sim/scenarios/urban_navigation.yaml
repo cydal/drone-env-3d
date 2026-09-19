@@ -1,0 +1,32 @@
+name: urban_navigation
+description: Buildings and obstacles. Drone starts on the plaza south of the urban grid; targets in the courtyards.
+world:
+  name: autonomous_city
+  file: autonomous_city.sdf
+  bounds: {x: [-160, 160], y: [-140, 170], z: [-1, 90]}
+  areas:
+    - {name: operations, x: [-50, 50], y: [-100, -30]}
+    - {name: urban, x: [20, 90], y: [0, 70]}
+    - {name: industrial, x: [-125, -10], y: [-10, 100]}
+    - {name: open_field, x: [35, 145], y: [-130, -45]}
+    - {name: hill, x: [-95, -25], y: [85, 155]}
+agents:
+  - id: drone_01
+    template: quadcopter
+    drone_type: standard
+    spawn: {position: {x: 56.0, y: -8.0, z: 0.25}}
+    observation: navigation
+    control: waypoint
+entities:
+  - id: target_01
+    template: target
+    spawn: {position: {x: 56.0, y: 41.0, z: 6.0}}
+    trajectory: {type: static}
+    params: {radius: 0.6, color: "0.2 0.9 0.4 1", collide: false}
+randomize:
+  agents:
+    drone_01: {region: {x: [40, 72], y: [-12, -4], z: [0.25, 0.25]}, yaw: true}
+  entities:
+    target_01: {region: {x: [30, 82], y: [10, 60], z: [4, 12]}}
+environment: {time_of_day: morning}
+simulation: {step_size: 0.004, real_time_factor: 0.0, seed: 11, start_paused: true, mode: stepped}

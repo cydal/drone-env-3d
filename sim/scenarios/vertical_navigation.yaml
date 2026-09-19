@@ -1,0 +1,33 @@
+name: vertical_navigation
+description: Towers, platforms and elevation changes. Start on the hill, targets on the sky platform, building helipad and relay tower.
+world:
+  name: autonomous_city
+  file: autonomous_city.sdf
+  bounds: {x: [-160, 160], y: [-140, 170], z: [-1, 90]}
+  areas:
+    - {name: operations, x: [-50, 50], y: [-100, -30]}
+    - {name: urban, x: [20, 90], y: [0, 70]}
+    - {name: industrial, x: [-125, -10], y: [-10, 100]}
+    - {name: open_field, x: [35, 145], y: [-130, -45]}
+    - {name: hill, x: [-95, -25], y: [85, 155]}
+agents:
+  - id: drone_01
+    template: quadcopter
+    drone_type: light
+    spawn: {position: {x: -60.0, y: 120.0, z: 10.75}}
+    observation: state
+    control: waypoint
+entities:
+  - id: target_01
+    template: target
+    spawn: {position: {x: 110.0, y: 50.0, z: 20.5}}
+    trajectory: {type: static}
+    params: {radius: 0.6, color: "0.2 0.9 0.4 1", collide: false}
+randomize:
+  entities:
+    target_01:
+      routes:
+        - {type: static}
+      region: {x: [56, 110], y: [41, 90], z: [19, 44]}
+environment: {time_of_day: evening}
+simulation: {step_size: 0.004, real_time_factor: 0.0, seed: 21, start_paused: true, mode: stepped}

@@ -374,6 +374,65 @@ def _with_pose(model: str, pose: Pose) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lighting presets (time of day) and environmental conditions
+# ---------------------------------------------------------------------------
+
+LIGHTING_PRESETS: dict[str, dict] = {
+    #            sun direction (unit, pointing *from* the sun), diffuse, ambient, background, fog colour
+    "morning": dict(hour=7.5,  direction=(0.75, 0.35, -0.55), diffuse=(1.0, 0.85, 0.65), specular=0.25,
+                    ambient=(0.38, 0.40, 0.48), background=(0.85, 0.78, 0.72), fog=(0.85, 0.80, 0.75), fog_density=0.0012),
+    "day":     dict(hour=13.0, direction=(-0.4, 0.3, -0.85), diffuse=(0.95, 0.93, 0.88), specular=0.3,
+                    ambient=(0.45, 0.45, 0.5), background=(0.68, 0.78, 0.9), fog=(0.72, 0.80, 0.90), fog_density=0.0006),
+    "evening": dict(hour=18.5, direction=(-0.8, -0.2, -0.35), diffuse=(1.0, 0.62, 0.38), specular=0.2,
+                    ambient=(0.30, 0.27, 0.32), background=(0.62, 0.45, 0.42), fog=(0.65, 0.48, 0.45), fog_density=0.0015),
+    "night":   dict(hour=23.0, direction=(0.3, 0.2, -0.9), diffuse=(0.18, 0.22, 0.35), specular=0.05,
+                    ambient=(0.10, 0.11, 0.16), background=(0.03, 0.04, 0.08), fog=(0.04, 0.05, 0.09), fog_density=0.0010),
+}
+
+
+def lighting_preset(time_of_day) -> dict:
+    """Accept a preset name or an hour (0-24) and return the nearest preset (copied)."""
+    if time_of_day is None:
+        return dict(LIGHTING_PRESETS["day"], name="day")
+    if isinstance(time_of_day, str):
+        key = time_of_day.lower()
+        if key not in LIGHTING_PRESETS:
+            raise ValueError(f"unknown time_of_day {time_of_day!r}; presets: {list(LIGHTING_PRESETS)}")
+        return dict(LIGHTING_PRESETS[key], name=key)
+    h = float(time_of_day) % 24
+    key = min(LIGHTING_PRESETS, key=lambda k: min(abs(LIGHTING_PRESETS[k]["hour"] - h), 24 - abs(LIGHTING_PRESETS[k]["hour"] - h)))
+    return dict(LIGHTING_PRESETS[key], name=key)
+
+
+def environment_block(scenario: Scenario) -> tuple[str, dict]:
+    """<scene> + <light> for the scenario's environment; also returns a JSON-able description
+    that the API exposes (SceneDesc.environment) so the browser matches the world's look."""
+    env = scenario.environment
+    L = lighting_preset(env.time_of_day)
+    vis = env.visibility  # metres; None = preset fog
+    fog_density = (1.0 / max(vis, 20.0)) * 1.5 if vis else L["fog_density"]
+    d = L["direction"]; c = L["diffuse"]; a = L["ambient"]; b = L["background"]; f = L["fog"]
+    sdf = f"""
+    <scene>
+      <ambient>{a[0]} {a[1]} {a[2]} 1</ambient>
+      <background>{b[0]} {b[1]} {b[2]} 1</background>
+      <shadows>true</shadows>
+      <fog><type>exp</type><color>{f[0]} {f[1]} {f[2]} 1</color><density>{fog_density:.5f}</density></fog>
+    </scene>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 80 0 0 0</pose>
+      <diffuse>{c[0]} {c[1]} {c[2]} 1</diffuse>
+      <specular>{L['specular']} {L['specular']} {L['specular']} 1</specular>
+      <direction>{d[0]} {d[1]} {d[2]}</direction>
+    </light>"""
+    desc = {"preset": L["name"], "hour": L["hour"], "sun_direction": list(d), "sun_color": list(c), "ambient": list(a),
+            "background": list(b), "fog_color": list(f), "fog_density": fog_density,
+            "wind": [env.wind.x, env.wind.y, env.wind.z] if env.wind else [0, 0, 0], "visibility_m": vis}
+    return sdf, desc
+
+
+# ---------------------------------------------------------------------------
 # World assembly: base world file + scenario -> concrete SDF
 # ---------------------------------------------------------------------------
 
@@ -419,5 +478,8 @@ def build_world_sdf(base_world_sdf: str, scenario: Scenario) -> str:
         models.append(_with_pose(tpl(e.id, e.params, wrap_in_sdf=False), e.spawn))
 
     out = base_world_sdf.replace("<!-- @physics -->", physics)
+    lighting, _ = environment_block(scenario)
+    if "<!-- @lighting -->" in out:
+        out = out.replace("<!-- @lighting -->", lighting)
     out = out.replace("<!-- @agents -->", "\n".join(models))
     return out

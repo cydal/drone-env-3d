@@ -520,8 +520,10 @@ class GazeboEngine(SimulationEngine):
         await self._refresh_scene()
         with self._lock:
             models = [self._convert_model(m) for m in self._scene_msg.model]
+        env = sdfgen.environment_block(self.scenario)[1] if self.scenario else None
         return SceneDesc(world=self.world, models=models,
-                         bounds=self.scenario.world.bounds if self.scenario else None)
+                         bounds=self.scenario.world.bounds if self.scenario else None, environment=env,
+                         areas=self.scenario.world.areas if self.scenario else [])
 
     def _convert_model(self, m) -> ModelDesc:
         links = []

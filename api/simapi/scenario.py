@@ -7,6 +7,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
+
 from .models import ActionLimits, EntityKind, Pose, Vec3
 
 
@@ -84,12 +85,13 @@ class WorldSpec(BaseModel):
     name: str                         # world name inside the SDF
     file: str                         # path relative to sim/worlds
     bounds: dict[str, list[float]] | None = None   # {"x": [min,max], "y": [...], "z": [...]}
+    areas: list[dict[str, Any]] = Field(default_factory=list)   # [{name, x:[..], y:[..]}] named regions
 
 
 class EnvironmentSpec(BaseModel):
     wind: Vec3 = Field(default_factory=Vec3)
-    time_of_day: float | None = None
-    visibility: float | None = None
+    time_of_day: str | float | None = None   # preset name (morning|day|evening|night) or hour 0-24
+    visibility: float | None = None          # metres (fog); None = preset default
 
 
 class SimulationSpec(BaseModel):
@@ -98,6 +100,30 @@ class SimulationSpec(BaseModel):
     seed: int = 0
     start_paused: bool = True
     mode: Literal["realtime", "stepped"] = "realtime"
+
+
+class RegionSpec(BaseModel):
+    x: list[float]
+    y: list[float]
+    z: list[float]
+
+
+class AgentRandomization(BaseModel):
+    region: RegionSpec | None = None      # spawn position sampled uniformly in the box
+    yaw: bool = False                     # random heading
+
+
+class EntityRandomization(BaseModel):
+    region: RegionSpec | None = None      # for static-trajectory entities: random position
+    routes: list["TrajectorySpec"] = Field(default_factory=list)   # pick one trajectory per seed
+
+
+class RandomizationSpec(BaseModel):
+    """Seeded, controlled randomisation of the initial conditions (brief 3b §20). The same
+    scenario seed always reproduces the same samples; `reset(seed=...)` picks a different draw."""
+    agents: dict[str, AgentRandomization] = Field(default_factory=dict)
+    entities: dict[str, EntityRandomization] = Field(default_factory=dict)
+    time_of_day: list[str] = Field(default_factory=list)   # choose one preset per seed (visual)
 
 
 class EpisodeSpec(BaseModel):
@@ -121,6 +147,7 @@ class Scenario(BaseModel):
     simulation: SimulationSpec = Field(default_factory=SimulationSpec)
     episode: EpisodeSpec = Field(default_factory=EpisodeSpec)
     logging: LoggingSpec = Field(default_factory=LoggingSpec)
+    randomize: RandomizationSpec = Field(default_factory=RandomizationSpec)
 
     @property
     def rendering(self) -> bool:

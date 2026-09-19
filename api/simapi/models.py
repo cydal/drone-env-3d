@@ -312,6 +312,7 @@ class Episode(BaseModel):
     status: EpisodeStatus = "created"
     max_sim_time: float | None = None
     log_path: str | None = None
+    randomization: dict[str, Any] = Field(default_factory=dict)   # seeded initial-condition draw
 
 
 class Event(BaseModel):
@@ -423,3 +424,5 @@ class SceneDesc(BaseModel):
     world: str
     models: list[ModelDesc]
     bounds: dict[str, list[float]] | None = None
+    environment: dict[str, Any] | None = None   # lighting preset, sun, ambient, fog, wind (see sdf.environment_block)
+    areas: list[dict[str, Any]] = Field(default_factory=list)   # named regions for the hierarchy / overview

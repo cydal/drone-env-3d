@@ -124,6 +124,7 @@ class SimulationService:
                 log.warning("agent %s: profile needs camera frames but no camera is configured", rt.spec.id)
         self._trajectories = TrajectoryController(scenario.entities)
         self._open_episode()
+        await self._apply_randomization()
         self._place_entities(0.0)
         self._start_tick()
         self.hub.publish_threadsafe({"type": "scenario_loaded", "scenario": scenario.model_dump(mode="json"),
@@ -180,12 +181,63 @@ class SimulationService:
                 rt.armed = True
                 rt.out_of_bounds = False
             self._open_episode()
+            await self._apply_randomization()
             self._place_entities(0.0)
             if self.mode == "realtime" and not self.scenario.simulation.start_paused:
                 await self.engine.resume()
             self._start_tick()
             self.hub.publish_threadsafe({"type": "reset", "episode": self.episode.model_dump(mode="json")})
         return self.episode, self.observations()
+
+    async def _apply_randomization(self) -> None:
+        """Seeded initial-condition sampling: agent spawns/yaws, entity positions/routes.
+        RNG is seeded by the simulator seed, so the same seed reproduces the same draw."""
+        self.randomization: dict[str, Any] = {}
+        rz = self.scenario.randomize if self.scenario else None
+        if rz is None or (not rz.agents and not rz.entities):
+            return
+        import random
+        rng = random.Random(self.engine.seed)
+        # deterministic order: sorted ids
+        for aid in sorted(rz.agents):
+            spec = rz.agents[aid]
+            if aid not in self.agents:
+                continue
+            draw: dict[str, Any] = {}
+            if spec.region:
+                r = spec.region
+                pos = (rng.uniform(*r.x), rng.uniform(*r.y), rng.uniform(*r.z))
+                yaw = rng.uniform(-math.pi, math.pi) if spec.yaw else 0.0
+                self.engine.set_pose(aid, Pose(position=type(Pose().position)(x=pos[0], y=pos[1], z=pos[2]),
+                                               orientation=type(Pose().orientation)(x=0, y=0, z=math.sin(yaw / 2), w=math.cos(yaw / 2))))
+                draw["position"] = list(pos); draw["yaw"] = yaw
+            self.randomization[aid] = draw
+        for eid in sorted(rz.entities):
+            spec = rz.entities[eid]
+            ent = next((e for e in self._trajectories.entities + (self.scenario.entities if self.scenario else []) if e.id == eid), None)
+            draw = {}
+            if spec.routes:
+                route = rng.choice(spec.routes)
+                if ent is not None:
+                    ent.trajectory = route
+                    if ent not in self._trajectories.entities and route.type != "static":
+                        self._trajectories.entities.append(ent)
+                draw["route"] = route.model_dump(mode="json")
+            if spec.region:
+                r = spec.region
+                pos = (rng.uniform(*r.x), rng.uniform(*r.y), rng.uniform(*r.z))
+                if ent is not None:
+                    ent.spawn = Pose(position=type(Pose().position)(x=pos[0], y=pos[1], z=pos[2]))
+                    if ent.trajectory.type == "static":
+                        self.engine.set_pose(eid, ent.spawn)
+                draw["position"] = list(pos)
+            self.randomization[eid] = draw
+        if rz.time_of_day:
+            self.randomization["time_of_day"] = rng.choice(rz.time_of_day)   # informational (world lighting is fixed at load)
+        if self.episode:
+            self.episode.randomization = self.randomization
+        if self._logger:
+            self._logger.write({"type": "randomization", "seed": self.engine.seed, "draw": self.randomization})
 
     def _open_episode(self) -> None:
         assert self.scenario is not None
@@ -616,6 +668,7 @@ class SimulationService:
                        for aid, rt in self.agents.items()},
             "events_total": self._event_seq,
             "recording": self.recorder.meta.__dict__ if self.recorder else None,
+            "randomization": getattr(self, "randomization", {}),
         }
 
     def recording_start(self, *, observations: bool = True, states: bool = True, frames: bool = False) -> dict[str, Any]:
