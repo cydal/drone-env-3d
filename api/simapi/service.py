@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import datetime as dt
+import json
 import logging
 import math
 import time
@@ -22,6 +23,7 @@ from .models import (Action, ActionLimits, ActionSpace, AgentInfo, ArmAction, Bo
                      VelocityAction, WaypointAction)
 from .observation import NEARBY_RADIUS_M, resolve_profile
 from .recording import EpisodeLogger
+from .recorder import Recorder, Snapshot, SnapshotStore
 from .scenario import AgentSpec, CameraSpec, Scenario, list_scenarios
 
 log = logging.getLogger(__name__)
@@ -61,6 +63,9 @@ class SimulationService:
         self.agents: dict[str, AgentRuntime] = {}
         self._runtime_spawned: set[str] = set()   # not part of the scenario's initial state
         self.overlay: dict | None = None            # last annotation pushed by an external tool
+        self.recorder: Recorder | None = None       # per-episode action log (+ optional rows)
+        self.snapshots = SnapshotStore(config.RUNS_DIR / "snapshots")
+        self._replaying = False
         self.events: collections.deque[Event] = collections.deque(maxlen=5000)
         self._event_seq = 0
         self._events_total = 0
@@ -188,6 +193,8 @@ class SimulationService:
         self._last_step_seq = 0
         self._timeout_fired = False
         run_dir = getattr(self.engine, "run_dir", None) or config.RUNS_DIR
+        self.recorder = Recorder(Path(run_dir) / "recordings", episode_id=eid, scenario=self.scenario.name,
+                                 seed=self.engine.seed, mode=self.mode, step_size=self.scenario.simulation.step_size)
         if self.scenario.logging.enabled:
             path = Path(run_dir) / f"episode_{eid}.jsonl"
             self._logger = EpisodeLogger(path, {"episode_id": eid, "scenario": self.scenario.model_dump(mode="json"),
@@ -195,6 +202,12 @@ class SimulationService:
             self.episode.log_path = str(path)
 
     def _close_episode(self, status: str) -> None:
+        if self.recorder is not None:
+            try:
+                self.recorder.finalize(self.engine.status().iterations)
+            except Exception:
+                pass
+            self.recorder = None
         if self.episode and self.episode.status in ("running", "paused", "created"):
             self.episode.status = status  # type: ignore[assignment]
         if self._logger:
@@ -274,6 +287,7 @@ class SimulationService:
         self._last_step_seq = self._event_seq
         obs = self.observations() if observe else {}
         self._log_sample(new_events)
+        self._record_row(actions or {}, new_events, obs)
         self._step_latency_ms = _ema(self._step_latency_ms, (time.monotonic() - t0) * 1000)
         self._sync_episode()
         return StepResponse(episode=self.episode, status=self.status(), observations=obs,
@@ -465,6 +479,9 @@ class SimulationService:
 
     def _apply_action(self, agent_id: str, action: Action) -> None:
         rt = self.validate_action(agent_id, action)
+        if self.recorder is not None and not self._replaying:
+            st = self.engine.status()
+            self.recorder.log_action(st.iterations, st.sim_time, agent_id, action)
         if isinstance(action, VelocityAction):
             rt.waypoint = None
             rt.control_mode = "velocity"
@@ -520,6 +537,136 @@ class SimulationService:
                 vx, vy, vz = vx * speed / n, vy * speed / n, vz * speed / n
             cmd = VelocityAction(vx=vx, vy=vy, vz=vz, yaw_rate=yaw_rate, frame="world").clamp(rt.spec.limits)
         self.engine.send_velocity(agent_id, cmd)
+
+    # ======================================================================
+    # world state, recording, snapshots, replay
+    # ======================================================================
+    def world_state(self) -> dict[str, Any]:
+        st = self.status()
+        return {
+            "sim_time": st.sim_time, "iteration": st.iterations, "paused": st.paused, "mode": self.mode,
+            "episode": self.episode.model_dump(mode="json") if self.episode else None,
+            "entities": [s.model_dump(mode="json") for e in self.engine.list_entities()
+                         if (s := self.engine.entity_state(e.entity_id))],
+            "agents": {aid: {"control_mode": rt.control_mode, "armed": rt.armed,
+                             "last_action": rt.last_action.model_dump(mode="json") if rt.last_action else None,
+                             "waypoint": rt.waypoint.model_dump(mode="json") if rt.waypoint else None}
+                       for aid, rt in self.agents.items()},
+            "events_total": self._event_seq,
+            "recording": self.recorder.meta.__dict__ if self.recorder else None,
+        }
+
+    def recording_start(self, *, observations: bool = True, states: bool = True, frames: bool = False) -> dict[str, Any]:
+        if self.recorder is None:
+            raise RuntimeError("no episode; load a scenario first")
+        self.recorder.start_rows(observations=observations, states=states, frames=frames)
+        return self.recorder.meta.__dict__
+
+    def recording_stop(self) -> dict[str, Any]:
+        if self.recorder is None:
+            raise RuntimeError("no episode")
+        self.recorder.stop_rows()
+        return self.recorder.meta.__dict__
+
+    def recordings(self) -> list[dict[str, Any]]:
+        out = []
+        for meta in sorted(config.RUNS_DIR.glob("*/recordings/*/meta.json")):
+            try:
+                d = json.loads(meta.read_text()); d["dir"] = str(meta.parent); out.append(d)
+            except Exception:
+                continue
+        return out
+
+    def recording_dir(self, recording_id: str) -> Path:
+        if self.recorder is not None and self.recorder.meta.recording_id == recording_id:
+            return self.recorder.dir
+        hits = list(config.RUNS_DIR.glob(f"*/recordings/{recording_id}"))
+        if not hits:
+            raise FileNotFoundError(f"recording {recording_id!r} not found")
+        return hits[0]
+
+    def snapshot(self, name: str | None = None) -> Snapshot:
+        if self.recorder is None or self.episode is None or self.scenario is None:
+            raise RuntimeError("no episode; load a scenario first")
+        st = self.status()
+        ws = self.world_state()
+        snap = Snapshot(
+            snapshot_id=SnapshotStore.new_id(name), name=name or "snapshot", created=time.time(),
+            episode_id=self.episode.episode_id, scenario=self.scenario.name, seed=self.engine.seed, mode=self.mode,
+            sim_time=st.sim_time, iteration=st.iterations, step_count=self.episode.step_count,
+            recording_dir=str(self.recorder.dir), action_index=len(self.recorder.actions),
+            entities={e["entity_id"]: e for e in ws["entities"]}, agents=ws["agents"], events_total=self._event_seq)
+        # persist a copy of the action log alongside the snapshot so it survives later episodes
+        self.snapshots.save(snap)
+        actions_copy = self.snapshots.dir / f"{snap.snapshot_id}.actions.jsonl"
+        actions_copy.write_text("".join(json.dumps(a.__dict__, separators=(",", ":")) + "\n"
+                                        for a in self.recorder.actions[:snap.action_index]))
+        return snap
+
+    async def restore(self, snapshot_id: str) -> dict[str, Any]:
+        """Replay-based restore: reset(scenario, seed) then re-apply the recorded actions up to the
+        snapshot, stepping the exact iteration counts between them. Returns the divergence between
+        the restored entity states and the captured ones (expected ~0 for stepped recordings)."""
+        snap = self.snapshots.load(snapshot_id)
+        actions_path = self.snapshots.dir / f"{snapshot_id}.actions.jsonl"
+        from .recorder import ActionRecord
+        actions = [ActionRecord(**json.loads(l)) for l in actions_path.open() if l.strip()] if actions_path.exists() else []
+        await self._replay_actions(snap.scenario, snap.seed, actions, snap.iteration)
+        ws = self.world_state()
+        div = _divergence(snap.entities, {e["entity_id"]: e for e in ws["entities"]})
+        self.hub.publish_threadsafe({"type": "restored", "snapshot": snapshot_id, "divergence": div})
+        return {"snapshot": snap.to_json(), "divergence": div, "state": ws}
+
+    async def replay(self, recording_id: str, *, until_iteration: int | None = None) -> dict[str, Any]:
+        """Re-run a recorded episode deterministically (stepped). Emits events and telemetry as it goes."""
+        d = self.recording_dir(recording_id)
+        is_current = self.recorder is not None and self.recorder.meta.recording_id == recording_id
+        if is_current:
+            self.recorder.meta.final_iteration = self.engine.status().iterations   # live episode: not finalized yet
+        meta = Recorder.load_meta(d) if not is_current else self.recorder.meta
+        actions = Recorder.load_actions(d) if not is_current else list(self.recorder.actions)
+        target = until_iteration if until_iteration is not None else (
+            meta.final_iteration or (actions[-1].iteration if actions else 0))
+        await self._replay_actions(meta.scenario, meta.seed, actions, target)
+        return {"recording": meta.__dict__, "replayed_to_iteration": target, "state": self.world_state()}
+
+    async def _replay_actions(self, scenario: str, seed: int, actions, until_iteration: int) -> None:
+        self._replaying = True
+        try:
+            await self.reset(seed=seed, scenario=scenario, mode="stepped")
+            if self.scenario is None or self.scenario.name != scenario or self.engine.seed != seed:
+                await self.load_scenario(scenario, seed=seed, mode="stepped")
+            cur = 0
+            for rec in actions:
+                if rec.iteration > until_iteration:
+                    break
+                if rec.iteration > cur:
+                    await self._raw_step(rec.iteration - cur); cur = rec.iteration
+                env = Action.__args__ if hasattr(Action, "__args__") else None  # noqa: F841
+                from .models import ActionEnvelope
+                self._apply_action(rec.agent_id, ActionEnvelope.model_validate({"action": rec.action}).action)
+            if until_iteration > cur:
+                await self._raw_step(until_iteration - cur)
+        finally:
+            self._replaying = False
+
+    async def _raw_step(self, n: int) -> None:
+        """Advance n iterations honouring environment entities and waypoint controllers, without
+        recording (replay must not re-log the actions it replays)."""
+        dt = self.scenario.simulation.step_size
+        t_now = self.engine.status().sim_time
+        chunk = SUBSTEP_ITERS if self._trajectories.entities else n
+        done = 0
+        while done < n:
+            k = min(chunk, n - done)
+            self._place_entities(t_now + (done + k) * dt)
+            if done == 0:
+                self._run_waypoint_controllers()
+            await self.engine.step(k)
+            done += k
+        if self.episode:
+            self.episode.step_count += 1
+        self._check_bounds_and_timeout()
 
     # ======================================================================
     # events
@@ -616,8 +763,22 @@ class SimulationService:
                         new = [e for e in self.events if e.seq > seq_logged]
                         seq_logged = self._event_seq
                         self._log_sample(new)
+                        self._record_row({}, new)
             except Exception:
                 log.exception("tick failed")
+
+    def _record_row(self, actions: dict[str, Action], events: list[Event], obs: dict[str, Observation] | None = None) -> None:
+        if self.recorder is None or not self.recorder.rows_enabled:
+            return
+        st = self.engine.status()
+        states = {e.entity_id: s.model_dump(mode="json") for e in self.engine.list_entities()
+                  if e.kind in ("drone", "vehicle", "target", "dynamic") and (s := self.engine.entity_state(e.entity_id))}
+        if obs is None and self.recorder.meta.observations:
+            obs = self.observations()
+        self.recorder.row(iteration=st.iterations, sim_time=st.sim_time,
+                          actions={k: v.model_dump(mode="json") for k, v in actions.items()}, states=states,
+                          observations={k: v.model_dump(mode="json") for k, v in (obs or {}).items()},
+                          events=[e.model_dump(mode="json") for e in events])
 
     def _log_sample(self, events: list[Event]) -> None:
         if not self._logger:
@@ -661,3 +822,20 @@ def _pose_compact(p: Pose) -> list[float]:
 
 def _ema(prev: float | None, x: float, a: float = 0.2) -> float:
     return x if prev is None else prev + a * (x - prev)
+
+
+def _divergence(a: dict[str, dict], b: dict[str, dict]) -> dict[str, Any]:
+    """Max position / velocity difference between two entity-state dicts (metres, m/s)."""
+    max_pos = max_vel = 0.0
+    per = {}
+    for eid, sa in a.items():
+        sb = b.get(eid)
+        if sb is None:
+            continue
+        pa, pb = sa["pose"]["position"], sb["pose"]["position"]
+        va, vb = sa["linear_velocity"], sb["linear_velocity"]
+        dp = math.sqrt(sum((pa[k] - pb[k]) ** 2 for k in "xyz"))
+        dv = math.sqrt(sum((va[k] - vb[k]) ** 2 for k in "xyz"))
+        per[eid] = {"position": dp, "velocity": dv}
+        max_pos, max_vel = max(max_pos, dp), max(max_vel, dv)
+    return {"max_position_m": max_pos, "max_velocity_mps": max_vel, "entities": per}

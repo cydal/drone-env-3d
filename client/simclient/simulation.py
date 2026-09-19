@@ -270,6 +270,52 @@ class Simulation:
                 data = ws.recv()
                 yield meta, data
 
+    # ---- world state, recording, snapshots, replay --------------------------
+    def world_state(self) -> dict[str, Any]:
+        """Full privileged world state: time, all entity states, agent commands, episode."""
+        return self._get("/world/state")
+
+    def recording_start(self, *, observations: bool = True, states: bool = True, frames: bool = False) -> dict[str, Any]:
+        """Turn on per-step rows (a replay buffer) for the current episode. Actions are always logged."""
+        return self._post("/recordings/start", {"observations": observations, "states": states, "frames": frames})
+
+    def recording_stop(self) -> dict[str, Any]:
+        return self._post("/recordings/stop")
+
+    def recordings(self) -> list[dict[str, Any]]:
+        return self._get("/recordings")
+
+    def recording(self, recording_id: str) -> dict[str, Any]:
+        return self._get(f"/recordings/{recording_id}")
+
+    def recording_rows(self, recording_id: str, since: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
+        """Pull rows [since, since+limit) -> (iteration, sim_time, actions, states, observations, events)."""
+        return self._get(f"/recordings/{recording_id}/rows", params={"since": since, "limit": limit})
+
+    def iter_rows(self, recording_id: str, batch: int = 500) -> Iterator[dict[str, Any]]:
+        since = 0
+        while True:
+            rows = self.recording_rows(recording_id, since, batch)
+            if not rows:
+                return
+            yield from rows
+            since += len(rows)
+
+    def replay(self, recording_id: str, until_iteration: int | None = None) -> dict[str, Any]:
+        """Deterministically re-run a recorded episode (stepped mode)."""
+        return self._post(f"/recordings/{recording_id}/replay", {"until_iteration": until_iteration})
+
+    def snapshot(self, name: str | None = None) -> dict[str, Any]:
+        """Capture the current state (+ the action log needed to reproduce it)."""
+        return self._post("/snapshots", {"name": name})
+
+    def snapshots(self) -> list[dict[str, Any]]:
+        return self._get("/snapshots")
+
+    def restore(self, snapshot_id: str) -> dict[str, Any]:
+        """Return the world to a snapshot by deterministic replay; result includes the divergence."""
+        return self._post(f"/snapshots/{snapshot_id}/restore")
+
     def overlay(self, data: dict[str, Any] | None) -> None:
         """Publish task/tool annotations for the browser (target, reward, status...). Simulator-agnostic."""
         if data is None:

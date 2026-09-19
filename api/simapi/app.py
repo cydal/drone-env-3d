@@ -247,6 +247,91 @@ def create_app(engine_factory=None) -> FastAPI:
         headers["Cache-Control"] = "no-store"
         return Response(content=data, media_type=meta["content_type"], headers=headers)
 
+    # ---- world state / recording / snapshots / replay --------------------------------
+    @app.get("/world/state")
+    def world_state():
+        _require_running(service)
+        return service.world_state()
+
+    @app.post("/recordings/start")
+    def recording_start(body: dict | None = None):
+        body = body or {}
+        try:
+            return service.recording_start(observations=body.get("observations", True), states=body.get("states", True),
+                                           frames=body.get("frames", False))
+        except Exception as e:
+            raise _err(e)
+
+    @app.post("/recordings/stop")
+    def recording_stop():
+        try:
+            return service.recording_stop()
+        except Exception as e:
+            raise _err(e)
+
+    @app.get("/recordings")
+    def recordings():
+        return service.recordings()
+
+    @app.get("/recordings/{recording_id}")
+    def recording(recording_id: str):
+        try:
+            d = service.recording_dir(recording_id)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        from .recorder import Recorder
+        meta = Recorder.load_meta(d).__dict__
+        meta["actions"] = [a.__dict__ for a in Recorder.load_actions(d)]
+        return meta
+
+    @app.get("/recordings/{recording_id}/rows")
+    def recording_rows(recording_id: str, since: int = 0, limit: int = 1000):
+        """Replay-buffer pull: rows [since, since+limit) of (iteration, sim_time, actions, states, observations, events)."""
+        try:
+            d = service.recording_dir(recording_id)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        from .recorder import Recorder
+        rec = Recorder.__new__(Recorder); rec.dir = d
+        return rec.read_rows(since, limit)
+
+    @app.post("/recordings/{recording_id}/replay")
+    async def replay(recording_id: str, body: dict | None = None):
+        body = body or {}
+        try:
+            return await service.replay(recording_id, until_iteration=body.get("until_iteration"))
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except Exception as e:
+            raise _err(e)
+
+    @app.post("/snapshots")
+    def snapshot(body: dict | None = None):
+        try:
+            return service.snapshot((body or {}).get("name")).to_json()
+        except Exception as e:
+            raise _err(e)
+
+    @app.get("/snapshots")
+    def snapshots():
+        return service.snapshots.list()
+
+    @app.get("/snapshots/{snapshot_id}")
+    def get_snapshot(snapshot_id: str):
+        try:
+            return service.snapshots.load(snapshot_id).to_json()
+        except FileNotFoundError:
+            raise HTTPException(404, "snapshot not found")
+
+    @app.post("/snapshots/{snapshot_id}/restore")
+    async def restore(snapshot_id: str):
+        try:
+            return await service.restore(snapshot_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "snapshot not found")
+        except Exception as e:
+            raise _err(e)
+
     # ---- overlay: task/tool annotations for the browser (simulator stays task-agnostic) ---
     @app.post("/overlay")
     async def overlay(body: dict):

@@ -114,3 +114,17 @@ stepping semantics, events and transports.
 * A strictly lock-stepped path (actions applied *inside* the physics step via a
   custom gz system) remains the Phase 3 upgrade if sub-millisecond action
   timing ever matters.
+
+
+## Snapshots and replay (Phase 3b)
+
+Snapshots are **replay-based**: every applied action is logged with its iteration
+stamp, a snapshot stores the entity states plus a pointer into that log, and
+restore = `reset(scenario, seed)` + re-apply the log. This is exact in stepped mode
+(verified: 0.0 m divergence over 13 entities including kinematic target/vehicle, and a
+branch taken from the restored state reproduces the same future bit for bit). The
+alternative — pushing an ECM state through gz-sim's `control/state` service — was
+tested and does not restore physics mid-episode in gz-sim 10.5. Per-step *rows*
+(states, observations, events, actions) are an opt-in replay buffer that external
+learners pull incrementally; they are written by the environment, so every algorithm
+codebase gets the same data without re-implementing logging.

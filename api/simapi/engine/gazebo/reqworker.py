@@ -27,8 +27,17 @@ def _worker_main(conn, partition: str) -> None:  # runs in the child process
     os.environ["GZ_PARTITION"] = partition
     from gz.transport import Node
     from google.protobuf import symbol_database
-    from . import transport as _t          # loads gz.msgs classes into the symbol database
+    from . import transport as _t          # loads the core gz.msgs classes
     _t.gz()
+    # load *every* gz.msgs module so any service's request/response type resolves by name
+    import importlib, pkgutil
+    import gz.msgs as _msgs
+    for m in pkgutil.iter_modules(_msgs.__path__):
+        if m.name.endswith("_pb2"):
+            try:
+                importlib.import_module(f"gz.msgs.{m.name}")
+            except Exception:
+                pass
     sdb = symbol_database.Default()
     node = Node()
     while True:

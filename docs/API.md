@@ -177,3 +177,32 @@ Each episode writes `runs/<run>/episode_<id>.jsonl`: an `episode` header
 realtime: per-agent state, last action, control mode, events) and `event`
 records. `GET /metrics`: real-time factor, physics Hz, step size, entity/agent
 counts, connected clients, step latency (EMA), sensor fps, event count.
+
+
+## World state, recording, snapshots, replay (Phase 3b)
+
+| endpoint | purpose |
+|---|---|
+| `GET /world/state` | privileged full state: sim time, iteration, every entity's state, each agent's latched command / control mode, episode, recording meta |
+| `POST /recordings/start {observations, states, frames}` | turn on per-step **rows** for the current episode (a replay buffer). Actions are *always* logged per episode with their iteration stamp |
+| `POST /recordings/stop` | stop rows |
+| `GET /recordings`, `GET /recordings/{id}` | list / meta + full action log |
+| `GET /recordings/{id}/rows?since=&limit=` | pull rows `(i, iteration, sim_time, actions, states, observations, events)` incrementally — external learners fill their own buffers from this |
+| `POST /recordings/{id}/replay {until_iteration?}` | deterministic re-run: reset(scenario, seed) then re-apply the action log |
+| `POST /snapshots {name}` | capture: entity states + agent commands + pointer into the action log (a copy of the log is stored with the snapshot) |
+| `GET /snapshots`, `GET /snapshots/{id}` | list / inspect |
+| `POST /snapshots/{id}/restore` | replay-based restore; returns the **divergence** between restored and captured states (0.0 for stepped-mode recordings) |
+
+Recordings live in `runs/<run>/recordings/<episode_id>/{meta.json, actions.jsonl, rows.jsonl}`;
+snapshots in `runs/snapshots/`.
+
+**Why replay-based.** gz-sim 10 accepts an ECM state through `/world/<w>/control/state`
+but physics does not adopt it mid-episode (verified: the drone kept flying from its
+current pose). The world *is* deterministic given scenario + seed + the per-iteration
+action sequence, so restore = reset + re-apply. Cost: about 8× faster than real time
+(a 20 s episode restores in ~2.5 s). Realtime-mode recordings replay each action at its
+recorded iteration, which is approximate because realtime actions arrive between
+iterations; the returned divergence tells you how approximate.
+
+Client: `sim.world_state()`, `sim.recording_start()/stop()`, `sim.recording_rows()`,
+`sim.iter_rows()`, `sim.replay(id)`, `sim.snapshot(name)`, `sim.restore(id)`.
