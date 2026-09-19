@@ -68,7 +68,8 @@ def main() -> int:
     ap.add_argument("--obstacle-features", type=int, default=None,
                     help="K nearest obstacles in the observation (default: 0 for open, 3 otherwise)")
     ap.add_argument("--collision-penalty", type=float, default=None, help="default 5 (open) / 25 (obstacle levels)")
-    ap.add_argument("--proximity-penalty", type=float, default=None, help="default 0 (open) / 0.5 per m inside the 2 m margin")
+    ap.add_argument("--proximity-penalty", type=float, default=None, help="default 0 (open) / 0.1 per m inside the safety margin")
+    ap.add_argument("--safe-margin", type=float, default=1.5, help="m from the obstacle surface where the proximity penalty starts")
     ap.add_argument("--lr-decay", action="store_true", help="linear learning-rate decay to 0 over the run")
     a = ap.parse_args()
 
@@ -81,8 +82,9 @@ def main() -> int:
     k = a.obstacle_features if a.obstacle_features is not None else (0 if a.level == "open" else 3)
     from .task import RewardConfig
     obstacle_level = a.level != "open"
-    reward = RewardConfig(collision=a.collision_penalty if a.collision_penalty is not None else (25.0 if obstacle_level else 5.0),
-                          proximity_penalty=a.proximity_penalty if a.proximity_penalty is not None else (0.5 if obstacle_level else 0.0))
+    reward = RewardConfig(collision=a.collision_penalty if a.collision_penalty is not None else (15.0 if obstacle_level else 5.0),
+                          proximity_penalty=a.proximity_penalty if a.proximity_penalty is not None else (0.1 if obstacle_level else 0.0),
+                          safe_margin=a.safe_margin)
     cfg = TaskConfig(level=a.level, observation=a.observation, max_steps=a.max_steps, seed=1, obstacle_features=k, reward=reward)
     scale = obs_scale_for(cfg)
     name = a.name or f"ppo_{a.level}_{a.observation}"
