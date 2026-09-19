@@ -222,16 +222,25 @@ class NavigationTask:
                 "profile": self.cfg.observation}
 
     # ---- internals -------------------------------------------------------------
+    @property
+    def scenario_name(self) -> str:
+        """Same world per level; the observation mode selects the agent's profile/sensors:
+        <level>            -> observation: state       (privileged)
+        <level>_navigation -> observation: navigation  (gps, imu, body velocity)
+        <level>_vision     -> observation: vision_nav  (camera, depth, imu, gps, velocity)"""
+        base = self.level["scenario"]
+        return base if self.cfg.observation == "state" else f"{base}_{self.cfg.observation}"
+
     def _ensure_loaded(self) -> None:
         st = self.sim.status()
-        if self._loaded and st.get("running") and st.get("scenario") == self.level["scenario"]:
+        if self._loaded and st.get("running") and st.get("scenario") == self.scenario_name:
             return
-        self.sim.reset(scenario=self.level["scenario"], seed=self.cfg.seed, mode="stepped")
-        prof = self.sim.agent(AGENT)["observation_space"]["profile"]
-        if prof != self.cfg.observation:
-            # the scenario decides what the agent may see; re-spawn is not needed because
-            # every profile below is derivable from the same simulator, we only *use* less
-            pass
+        self.sim.reset(scenario=self.scenario_name, seed=self.cfg.seed, mode="stepped")
+        comps = self.sim.agent(AGENT)["observation_space"]["components"]
+        if self.cfg.observation == "state" and "state" not in comps:
+            raise RuntimeError(f"scenario {self.scenario_name} does not expose privileged state")
+        if self.cfg.observation != "state" and "gps" not in comps:
+            raise RuntimeError(f"scenario {self.scenario_name} lacks gps; navigation/vision modes need it")
         self._loaded = True
 
     def _reset_state(self) -> None:
