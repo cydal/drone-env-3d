@@ -10,3 +10,4 @@ runs/
 briefs/*.egg-info/
 experiments/
 datasets/
+briefs/
