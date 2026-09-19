@@ -56,6 +56,8 @@ LEVELS: dict[str, dict[str, Any]] = {
 @dataclass
 class RewardConfig:
     progress: float = 1.0          # per metre of distance reduction toward the target
+    distance_penalty: float = 0.02 # * distance per step: dense pull toward the target (progress alone
+                                   #   sums to d0 - dT and gives no incentive to be fast or precise)
     time_penalty: float = 0.01     # per step
     collision: float = 5.0         # subtracted on collision (episode ends)
     out_of_bounds: float = 5.0
@@ -179,7 +181,8 @@ class NavigationTask:
         reached = dist < self.cfg.success_radius
 
         r = self.cfg.reward
-        reward = r.progress * (self.prev_distance - dist) - r.time_penalty - r.action_penalty * float(np.sum(a * a))
+        reward = (r.progress * (self.prev_distance - dist) - r.distance_penalty * dist
+                  - r.time_penalty - r.action_penalty * float(np.sum(a * a)))
         terminated, termination = False, None
         if reached:
             reward += r.reached; terminated, termination = True, "reached"

@@ -30,9 +30,11 @@ OBS_SCALE = np.array([20, 20, 10, 5, 5, 5, 1, 1, 10, 30, 1, 1], dtype=np.float32
 def make_env_fn(cfg: TaskConfig, port: int, seed: int):
     def _f():
         import gymnasium as gym
+        from stable_baselines3.common.monitor import Monitor
         env = NavigationGymEnv(cfg, port=port)
         env = gym.wrappers.TransformObservation(env, lambda o: (o / OBS_SCALE).astype(np.float32),
                                                 gym.spaces.Box(-np.inf, np.inf, (12,), np.float32))
+        env = Monitor(env)               # logs ep_rew_mean / ep_len_mean to tensorboard + stdout
         env.reset(seed=seed)
         return env
     return _f
@@ -55,6 +57,8 @@ def main() -> int:
     ap.add_argument("--max-steps", type=int, default=200); ap.add_argument("--base-port", type=int, default=8101)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--n-steps", type=int, default=512)
     ap.add_argument("--batch-size", type=int, default=256); ap.add_argument("--ent-coef", type=float, default=0.0)
+    ap.add_argument("--gamma", type=float, default=0.98); ap.add_argument("--log-std-init", type=float, default=-0.5,
+                    help="initial action noise: std = exp(x) in normalised action units (default 0.6 -> 1.8 m/s)")
     a = ap.parse_args()
 
     from stable_baselines3 import PPO
@@ -70,7 +74,7 @@ def main() -> int:
         "action_space": "Box(-1,1)^3 -> world-frame velocity * max_speed", "obs_scale": OBS_SCALE.tolist(),
         "reward": cfg.reward.__dict__, "n_envs": a.n_envs, "total_steps": a.steps, "seed": a.seed,
         "ppo": {"learning_rate": a.lr, "n_steps": a.n_steps, "batch_size": a.batch_size, "ent_coef": a.ent_coef,
-                "gamma": 0.99, "gae_lambda": 0.95, "policy": "MlpPolicy [64,64]"},
+                "gamma": a.gamma, "gae_lambda": 0.95, "policy": "MlpPolicy [64,64]", "log_std_init": a.log_std_init},
         "evalset": EVALSET_FOR_LEVEL[a.level], "eval_every": a.eval_every,
     })
     print("experiment:", exp.dir)
@@ -80,8 +84,8 @@ def main() -> int:
     try:
         venv = SubprocVecEnv([make_env_fn(cfg, p, a.seed + i) for i, p in enumerate(pool.ports)], start_method="spawn")
         model = PPO("MlpPolicy", venv, learning_rate=a.lr, n_steps=a.n_steps, batch_size=a.batch_size, ent_coef=a.ent_coef,
-                    gamma=0.99, gae_lambda=0.95, seed=a.seed, verbose=1, tensorboard_log=str(exp.path("tb")),
-                    policy_kwargs={"net_arch": [64, 64]}, device="cpu")
+                    gamma=a.gamma, gae_lambda=0.95, seed=a.seed, verbose=1, tensorboard_log=str(exp.path("tb")),
+                    policy_kwargs={"net_arch": [64, 64], "log_std_init": a.log_std_init}, device="cpu")
         evalset = load_evalset(EVALSET_FOR_LEVEL[a.level]); evalset["name"] = EVALSET_FOR_LEVEL[a.level]
         evalset_small = {**evalset, "pairs": evalset["pairs"][:a.eval_episodes]}
 

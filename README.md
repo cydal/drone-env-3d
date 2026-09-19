@@ -233,6 +233,43 @@ one flies out of frame — there is no off-screen indicator yet, see Known limit
                                                                # reproducibility, collisions, frames (~3 min)
 ```
 
+## Phase 3 — the first learned agent
+
+The learning layer lives in [`learn/envdr3d_learn/`](learn/envdr3d_learn/) and
+depends only on `simclient`; the simulator contains no RL logic. Details:
+[`docs/LEARNING.md`](docs/LEARNING.md).
+
+```python
+from simclient import Simulation
+from envdr3d_learn import NavigationTask, TaskConfig
+
+task = NavigationTask(Simulation("localhost"), TaskConfig(level="open", observation="state"))
+obs, info = task.reset(seed=3)                     # random start + target, drone teleported & armed
+while True:
+    obs, reward, terminated, truncated, info = task.step(policy(obs))   # action: world-frame velocity in [-1,1]^3
+    if terminated or truncated: break               # reached | collision | out_of_bounds | timeout | truncated
+```
+
+* **Task**: point-to-point navigation, three levels (`open`, `pillars`, `city`),
+  randomised start/target, configurable reward and success/failure outside the simulator.
+* **Observation modes**: `state` (privileged), `navigation` (GPS/IMU/velocity),
+  `vision` (camera + depth + IMU + GPS); same 12-d task vector, different sources.
+* **Baselines**: `random` and the engineered `waypoint` controller, evaluated on the
+  same fixed sets as any learned policy.
+* **Training**: `python -m envdr3d_learn.train_ppo` (stable-baselines3 PPO, N parallel
+  simulators, periodic evaluation on the fixed set, checkpoints, experiment.json).
+* **Evaluation**: fixed, seeded sets in `eval_sets/` (unseen during training);
+  metrics: success/collision/timeout rates, time to target, path efficiency,
+  final distance, action smoothness; per-episode traces for failure analysis.
+* **Datasets**: `python -m envdr3d_learn.record` writes `obs_t, a_t, obs_{t+1}` aligned
+  `.npz` trajectories (demonstrations from the waypoint controller included).
+* **Demo**: `python examples/demo_policy.py --policy <waypoint|model.zip>` plays a policy
+  in the browser at real-time pace with a task overlay (target ring, distance, reward, action).
+
+### Results (Level 1, open field, fixed 20-pair evaluation set)
+
+RESULTS_TABLE
+
 ## Status (2026-09-19) — vertical slice verified
 
 Gazebo → API → external Python controller → drone moves → browser sees it: **working.**
