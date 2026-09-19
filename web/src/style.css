@@ -58,3 +58,9 @@ h3.mt { margin-top: 18px; }
 .keys { color: var(--dim); font-size: 11px; margin-top: 6px; }
 #sensors img { width: 100%; background: #000; border-radius: 6px; display: block; margin-top: 6px; min-height: 60px; }
 .cap { font-size: 10px; color: var(--dim); margin: 2px 0 6px; }
+
+.bars { display: flex; gap: 6px; margin-top: 6px; }
+.bars .bar { flex: 1; height: 34px; background: #182030; border: 1px solid var(--line); border-radius: 4px; position: relative; overflow: hidden; }
+.bars .bar span { position: absolute; left: 50%; top: 0; bottom: 0; background: var(--accent2); opacity: .8; }
+.bars .bar label { position: absolute; left: 4px; bottom: 1px; font-size: 9px; color: var(--dim); font-family: var(--mono); }
+#task-status.ok { color: var(--ok); } #task-status.bad { color: var(--bad); }

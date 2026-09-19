@@ -70,6 +70,11 @@
         <label class="toggle"><input type="checkbox" id="manual-toggle" /> keyboard → public action API</label>
         <div class="keys mono">W/S fwd·back  A/D left·right<br/>R/F up·down    Q/E yaw<br/>X hold   Z arm/disarm</div>
       </div>
+      <div id="taskpanel" class="hidden">
+        <h3 class="mt">Task <span id="task-status" class="badge"></span></h3>
+        <div id="task-body" class="mono"></div>
+        <div id="task-action" class="bars"></div>
+      </div>
       <div id="sensors" class="hidden">
         <h3 class="mt">Sensors <span id="sensor-fps" class="badge"></span></h3>
         <img id="img-camera" alt="camera" /><div class="cap">RGB camera</div>

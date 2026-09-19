@@ -44,6 +44,7 @@ export const api = {
   step: (n = 1) => post("/simulation/step", { steps: n, observe: false }),
   reset: (seed?: number | null) => post("/episode/reset", seed != null ? { seed } : {}),
   action: (agent: string, action: any) => post(`/agents/${agent}/action`, { action }),
+  overlay: () => j<any>("/overlay"),
 };
 
 export type WsMessage =
@@ -51,7 +52,15 @@ export type WsMessage =
   | { type: "state"; sim_time: number; paused: boolean; mode: string; rtf: number; iterations: number; poses: Record<string, number[]>; vel: Record<string, number[]> }
   | { type: "event" } & SimEvent
   | { type: "scenario_loaded"; episode: Episode } | { type: "scene_changed" } | { type: "reset"; episode: Episode }
-  | { type: "ack"; for: string; status: SimStatus } | { type: "error"; for: string; message: string };
+  | { type: "ack"; for: string; status: SimStatus } | { type: "error"; for: string; message: string }
+  | { type: "overlay"; data: TaskOverlay | null };
+
+/** Annotation pushed by an external task/tool via POST /overlay. The simulator does not interpret it. */
+export interface TaskOverlay {
+  task: string; level?: string; agent: string; target: number[]; start?: number[]; distance: number; success_radius?: number;
+  step: number; max_steps?: number; reward: number; return: number; status: string; action: number[] | null;
+  observation?: number[]; observation_mode?: string;
+}
 
 export class Telemetry {
   private ws: WebSocket | null = null; private closed = false; private timer: any;

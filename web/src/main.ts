@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { api, FrameStream, Telemetry, type AgentInfo, type SimEvent, type SimStatus, type WsMessage } from "./api";
+import { api, FrameStream, Telemetry, type AgentInfo, type SimEvent, type SimStatus, type TaskOverlay, type WsMessage } from "./api";
 import { WorldScene, type Overlays } from "./scene";
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -187,10 +187,12 @@ function applyStatus(s: Partial<SimStatus> & { rtf?: number }) {
 const tele = new Telemetry((m: WsMessage) => {
   switch (m.type) {
     case "hello": applyStatus(m.status); loadScene(); break;
-    case "state": applyStatus({ sim_time: m.sim_time, paused: m.paused, mode: m.mode as any, real_time_factor: m.rtf, iterations: m.iterations }); world.updatePoses(m.poses, m.vel); break;
+    case "state": applyStatus({ sim_time: m.sim_time, paused: m.paused, mode: m.mode as any, real_time_factor: m.rtf, iterations: m.iterations }); world.updatePoses(m.poses, m.vel);
+      if (overlay) world.setTaskOverlay(overlay.agent, overlay.target, overlay.start ?? null, overlay.success_radius ?? 1, overlay.status); break;
     case "event": addEvent(m); break;
     case "scenario_loaded": case "scene_changed": loadScene(); refreshScenarios(); api.status().then(applyStatus); break;
     case "reset": world.clearTrails(); framedOnce = false; loadScene(); api.status().then(applyStatus); break;
+    case "overlay": applyOverlay(m.data); break;
     case "ack": if (m.status) applyStatus(m.status); break;
     case "error": toast(m.message); break;
   }
@@ -265,6 +267,34 @@ renderer.domElement.addEventListener("pointerdown", e => {
   };
   renderer.domElement.addEventListener("pointerup", up);
 });
+
+// ---- task overlay (external task/tool annotations; see POST /overlay) --------------------
+let overlay: TaskOverlay | null = null;
+function applyOverlay(o: TaskOverlay | null) {
+  overlay = o;
+  const panel = $("#taskpanel");
+  panel.classList.toggle("hidden", !o);
+  if (!o) { world.setTaskOverlay(null, null, null); return; }
+  const st = $("#task-status"); st.textContent = o.status; st.className = "badge " + (o.status === "reached" ? "ok" : o.status === "running" ? "" : "bad");
+  const dist = o.distance.toFixed(2).padStart(7);
+  $("#task-body").innerHTML =
+    `<span class="k">${o.task}</span> ${o.level ?? ""} · ${o.observation_mode ?? ""} · agent ${o.agent}\n` +
+    `<span class="k">distance</span> ${dist} m   <span class="k">radius</span> ${(o.success_radius ?? 0).toFixed(1)} m\n` +
+    `<span class="k">step</span> ${String(o.step).padStart(4)} / ${o.max_steps ?? "?"}   <span class="k">reward</span> ${o.reward.toFixed(3).padStart(8)}   <span class="k">return</span> ${o.return.toFixed(1).padStart(7)}\n` +
+    (o.observation ? `<span class="k">obs</span> [${o.observation.slice(0, 6).map(v => v.toFixed(2)).join(", ")}, …]` : "");
+  const bars = $("#task-action"); bars.innerHTML = "";
+  for (const [i, lbl] of ["vx", "vy", "vz"].entries()) {
+    const v = o.action ? o.action[i] : 0;
+    const bar = document.createElement("div"); bar.className = "bar";
+    const fill = document.createElement("span");
+    const pct = Math.min(1, Math.abs(v)) * 50;
+    fill.style.width = pct + "%"; fill.style.left = v >= 0 ? "50%" : (50 - pct) + "%";
+    const l = document.createElement("label"); l.textContent = `${lbl} ${v.toFixed(2)}`;
+    bar.appendChild(fill); bar.appendChild(l); bars.appendChild(bar);
+  }
+  world.setTaskOverlay(o.agent, o.target, o.start ?? null, o.success_radius ?? 1, o.status);
+}
+api.overlay().then(o => applyOverlay(o && o.task ? o : null)).catch(() => {});
 
 // ---- health strip ----------------------------------------------------------------
 async function refreshHealth() {

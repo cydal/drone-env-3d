@@ -8,3 +8,5 @@ runs/
 *.log
 .DS_Store
 briefs/*.egg-info/
+experiments/
+datasets/

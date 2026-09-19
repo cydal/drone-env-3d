@@ -196,6 +196,32 @@ export class WorldScene {
     if (!o.velocity) for (const a of this.arrows.values()) a.visible = false;
   }
 
+  // ---- task overlay: target ring, start marker, drone->target line ----------------
+  private taskObjs: THREE.Object3D[] = [];
+  setTaskOverlay(agentId: string | null, target: number[] | null, start: number[] | null, radius = 1.0, status = "running") {
+    for (const o of this.taskObjs) this.scene.remove(o);
+    this.taskObjs = [];
+    if (!target) return;
+    const color = status === "reached" ? 0x2ecc71 : status === "running" ? 0xffd166 : 0xff3b3b;
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(radius, 0.06, 8, 48), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }));
+    ring.position.set(target[0], target[1], target[2]); ring.rotation.x = Math.PI / 2;
+    const ring2 = ring.clone(); ring2.rotation.set(0, 0, 0);
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, target[2], 8), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35 }));
+    beam.position.set(target[0], target[1], target[2] / 2); beam.rotation.x = Math.PI / 2;
+    this.taskObjs.push(ring, ring2, beam);
+    if (start) {
+      const sm = new THREE.Mesh(new THREE.RingGeometry(0.6, 0.8, 32), new THREE.MeshBasicMaterial({ color: 0x2ab1ff, side: THREE.DoubleSide, transparent: true, opacity: 0.8 }));
+      sm.position.set(start[0], start[1], 0.05); this.taskObjs.push(sm);
+    }
+    const g = agentId ? this.models.get(agentId) : undefined;
+    if (g) {
+      const geo = new THREE.BufferGeometry().setFromPoints([g.position.clone(), new THREE.Vector3(target[0], target[1], target[2])]);
+      const line = new THREE.Line(geo, new THREE.LineDashedMaterial({ color, dashSize: 0.5, gapSize: 0.3, transparent: true, opacity: 0.7 }));
+      line.computeLineDistances(); this.taskObjs.push(line);
+    }
+    for (const o of this.taskObjs) this.scene.add(o);
+  }
+
   select(id: string | null) {
     this.selectedId = id;
     if (this.selBox) { this.scene.remove(this.selBox); this.selBox = null; }
