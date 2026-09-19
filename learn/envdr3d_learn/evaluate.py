@@ -50,18 +50,33 @@ def run_eval(policy, cfg: TaskConfig, evalset: dict[str, Any], *, sim: Simulatio
     results: list[EpisodeResult] = []
     per_episode = []
     t_start = time.time()
+    from simclient.simulation import SimulationError
     for i, pair in enumerate(evalset["pairs"]):
-        policy.reset()
-        obs, info = task.reset(seed=1000 + i, pair=pair)
-        done = False
-        trace = []
-        while not done:
-            a = policy(obs)
-            obs, r, term, trunc, info = task.step(a)
-            done = term or trunc
-            trace.append({"t": round(info["sim_time"], 3), "distance": round(info["distance"], 3),
-                          "position": [round(v, 3) for v in info["position"]], "velocity": [round(v, 3) for v in info["velocity"]],
-                          "action": [round(float(v), 3) for v in a], "reward": round(float(r), 4), "events": info["events"]})
+        for attempt in range(3):
+            try:
+                policy.reset()
+                obs, info = task.reset(seed=1000 + i, pair=pair)
+                done = False
+                trace = []
+                while not done:
+                    a = policy(obs)
+                    obs, r, term, trunc, info = task.step(a)
+                    done = term or trunc
+                    trace.append({"t": round(info["sim_time"], 3), "distance": round(info["distance"], 3),
+                                  "position": [round(v, 3) for v in info["position"]], "velocity": [round(v, 3) for v in info["velocity"]],
+                                  "action": [round(float(v), 3) for v in a], "reward": round(float(r), 4), "events": info["events"]})
+                break
+            except (SimulationError, RuntimeError) as e:
+                # a wedged/crashed simulator must not invalidate an evaluation: relaunch and redo the pair
+                print(f"  [{pair['id']}] simulator error ({str(e)[:80]}); relaunching (attempt {attempt + 1})")
+                try:
+                    sim.shutdown()
+                except Exception:
+                    pass
+                task._loaded = False
+                time.sleep(1.0)
+        else:
+            raise RuntimeError(f"evaluation of {pair['id']} failed after 3 simulator relaunches")
         res: EpisodeResult = info["result"]
         results.append(res)
         per_episode.append({"pair": pair["id"], **res.__dict__, "trace": trace})

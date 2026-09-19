@@ -268,7 +268,24 @@ while True:
 
 ### Results (Level 1, open field, fixed 20-pair evaluation set)
 
-RESULTS_TABLE
+Experiment A (state observations, open field, randomised start/target; evaluation on 20 fixed pairs never seen in training).
+Experiment `20260919-160520_ppo_open_state_v3_ce30`: PPO, 150k steps, 4 parallel simulators, ~36 min wall on a laptop.
+
+| policy | success | collision | time to target (s) | path eff. | final dist (m) | action Δ |
+|---|---|---|---|---|---|---|
+| **PPO (learned, frozen)** | 1.00 | 0.00 | 8.6 | 0.98 | 0.91 | 0.008 |
+| waypoint controller (engineered) | 1.00 | 0.00 | 8.6 | 1.00 | 0.83 | 0.002 |
+| random | 0.00 | 0.00 | — | — | 21.57 | 0.664 |
+
+Success on the 10-pair evaluation subset during training: 0%@25k → 60%@50k → 90%@75k → 100%@100k → 100%@125k → 100%@150k.
+
+Two earlier runs failed and were diagnosed with the trace tooling (see
+[`docs/LEARNING.md`](docs/LEARNING.md), *Lessons*): a reward-shaping problem and a
+task-layer bug where saturated actions were rejected by the simulator's limits.
+
+Level 2 (pillars) baseline: the straight-line waypoint controller collides in 15/20
+episodes (20 % success) — obstacle navigation is a real, measurable problem for
+Experiment B.
 
 ## Status (2026-09-19) — vertical slice verified
 
