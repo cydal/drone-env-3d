@@ -291,7 +291,8 @@ def build_world_sdf(base_world_sdf: str, scenario: Scenario) -> str:
     </physics>
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
     <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster">
-      <dynamic_pose_hertz>60</dynamic_pose_hertz>
+      <!-- >= physics rate so every iteration publishes: the pose read after a step is exact -->
+      <dynamic_pose_hertz>{max(60, int(round(1.0 / sim.step_size)))}</dynamic_pose_hertz>
       <state_hertz>10</state_hertz>
     </plugin>
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>

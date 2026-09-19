@@ -1,25 +1,71 @@
-// Builds/updates a three.js scene from SceneDesc. Gazebo is Z-up, so we keep
-// Gazebo coordinates verbatim and tell three.js that up is +Z.
+// Builds/updates a three.js scene from SceneDesc plus debug overlays.
+// Gazebo is Z-up: we keep Gazebo coordinates verbatim and set up = +Z.
 import * as THREE from "three";
-import type { ModelDesc, Pose, SceneDesc, Visual } from "./api";
+import type { AgentInfo, ModelDesc, Pose, SceneDesc, Visual } from "./api";
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+
+export interface Overlays { trails: boolean; velocity: boolean; axes: boolean; labels: boolean; collisions: boolean; frustum: boolean; bounds: boolean; collisionGeom: boolean }
+
+const TRAIL_LEN = 900;   // ~36 s at 25 Hz
+
+class Trail {
+  readonly line: THREE.Line;
+  private pos: Float32Array = new Float32Array(TRAIL_LEN * 3);
+  private n = 0; private head = 0;
+  constructor(color: THREE.Color) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(this.pos, 3));
+    g.setDrawRange(0, 0);
+    this.line = new THREE.Line(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.8 }));
+    this.line.frustumCulled = false;
+  }
+  push(p: THREE.Vector3) {
+    // keep chronological order by shifting when full (cheap enough at 25 Hz)
+    if (this.n === TRAIL_LEN) { this.pos.copyWithin(0, 3); this.n--; }
+    this.pos.set([p.x, p.y, p.z], this.n * 3); this.n++;
+    const attr = this.line.geometry.getAttribute("position") as THREE.BufferAttribute;
+    attr.needsUpdate = true;
+    this.line.geometry.setDrawRange(0, this.n);
+  }
+  clear() { this.n = 0; this.line.geometry.setDrawRange(0, 0); }
+}
+
+function makeLabel(text: string, color: string): THREE.Sprite {
+  const c = document.createElement("canvas"); c.width = 256; c.height = 64;
+  const ctx = c.getContext("2d")!;
+  ctx.font = "bold 28px ui-monospace, Menlo, monospace";
+  ctx.fillStyle = "rgba(11,14,19,0.75)"; ctx.fillRect(0, 8, ctx.measureText(text).width + 24, 48);
+  ctx.fillStyle = color; ctx.fillText(text, 12, 42);
+  const tex = new THREE.CanvasTexture(c);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  s.scale.set(2.4, 0.6, 1); s.center.set(0, 0.5);
+  return s;
+}
 
 export class WorldScene {
   readonly scene = new THREE.Scene();
   readonly models = new Map<string, THREE.Group>();
   readonly meta = new Map<string, ModelDesc>();
+  readonly agentColors = new Map<string, THREE.Color>();
+  private trails = new Map<string, Trail>();
+  private arrows = new Map<string, THREE.ArrowHelper>();
+  private labels = new Map<string, THREE.Sprite>();
+  private axes = new Map<string, THREE.AxesHelper>();
+  private frustums = new Map<string, THREE.LineSegments>();
+  private collisionMarks: { m: THREE.Mesh; t: number }[] = [];
+  private collisionGeoms: THREE.Object3D[] = [];
+  private boundsBox: THREE.LineSegments | null = null;
   private selectedId: string | null = null;
   private selBox: THREE.BoxHelper | null = null;
+  overlays: Overlays = { trails: true, velocity: true, axes: false, labels: true, collisions: true, frustum: false, bounds: false, collisionGeom: false };
 
   constructor() {
     this.scene.background = new THREE.Color(0x0b0e13);
     this.scene.fog = new THREE.Fog(0x0b0e13, 180, 420);
-    const hemi = new THREE.HemisphereLight(0xbfd4ff, 0x2a2622, 0.9);
-    this.scene.add(hemi);
+    this.scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2a2622, 0.9));
     const sun = new THREE.DirectionalLight(0xfff1d6, 2.2);
-    sun.position.set(40, -30, 85);
-    sun.castShadow = true;
+    sun.position.set(40, -30, 85); sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     const c = sun.shadow.camera as THREE.OrthographicCamera;
     c.left = c.bottom = -120; c.right = c.top = 120; c.far = 300;
@@ -29,49 +75,114 @@ export class WorldScene {
     this.scene.add(grid);
   }
 
-  rebuild(desc: SceneDesc) {
+  rebuild(desc: SceneDesc, agents: AgentInfo[]) {
     for (const g of this.models.values()) this.scene.remove(g);
-    this.models.clear(); this.meta.clear();
-    for (const m of desc.models) this.addModel(m);
+    for (const t of this.trails.values()) this.scene.remove(t.line);
+    for (const a of this.arrows.values()) this.scene.remove(a);
+    for (const l of this.labels.values()) this.scene.remove(l);
+    for (const f of this.frustums.values()) this.scene.remove(f);
+    for (const c of this.collisionGeoms) this.scene.remove(c);
+    this.models.clear(); this.meta.clear(); this.trails.clear(); this.arrows.clear(); this.labels.clear(); this.axes.clear(); this.frustums.clear(); this.collisionGeoms = [];
+    const info = new Map(agents.map(a => [a.agent_id, a]));
+    for (const m of desc.models) this.addModel(m, info.get(m.entity_id));
+    if (this.boundsBox) { this.scene.remove(this.boundsBox); this.boundsBox = null; }
+    if (desc.bounds) {
+      const b = desc.bounds; const sx = b.x[1] - b.x[0], sy = b.y[1] - b.y[0], sz = b.z[1] - b.z[0];
+      const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(sx, sy, sz));
+      this.boundsBox = new THREE.LineSegments(geo, new THREE.LineDashedMaterial({ color: 0xffaa33, dashSize: 3, gapSize: 2, transparent: true, opacity: 0.5 }));
+      this.boundsBox.computeLineDistances();
+      this.boundsBox.position.set(b.x[0] + sx / 2, b.y[0] + sy / 2, b.z[0] + sz / 2);
+      this.scene.add(this.boundsBox);
+    }
+    this.applyOverlays();
     if (this.selectedId) this.select(this.selectedId);
   }
 
-  addModel(m: ModelDesc) {
-    const group = new THREE.Group();
-    group.name = m.entity_id;
+  addModel(m: ModelDesc, info?: AgentInfo) {
+    const group = new THREE.Group(); group.name = m.entity_id;
     applyPose(group, m.pose);
+    let mainColor: THREE.Color | null = null;
     for (const link of m.links) {
-      const lg = new THREE.Group();
-      applyPose(lg, link.pose);
+      const lg = new THREE.Group(); applyPose(lg, link.pose);
       for (const v of link.visuals) {
         const mesh = makeVisual(v, m);
-        if (mesh) lg.add(mesh);
+        if (mesh) { lg.add(mesh); if (!mainColor && v.color) mainColor = new THREE.Color(v.color[0], v.color[1], v.color[2]); }
       }
       group.add(lg);
     }
-    this.scene.add(group);
-    this.models.set(m.entity_id, group);
-    this.meta.set(m.entity_id, m);
+    // collision geometry approximation: bounding boxes of the visuals, drawn as wireframes
+    if (m.entity_id !== "ground") {
+      const box = new THREE.Box3().setFromObject(group);
+      const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
+      const wire = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(size.x, size.y, size.z)),
+        new THREE.LineBasicMaterial({ color: m.is_agent ? 0xff5555 : 0x44ff88, transparent: true, opacity: 0.6 }));
+      wire.position.copy(center).sub(group.position); wire.visible = this.overlays.collisionGeom;
+      group.add(wire); this.collisionGeoms.push(wire);
+    }
+    this.scene.add(group); this.models.set(m.entity_id, group); this.meta.set(m.entity_id, m);
+
+    if (m.is_agent || m.kind === "target" || m.kind === "vehicle") {
+      const color = mainColor ?? new THREE.Color(0xff8a2a);
+      this.agentColors.set(m.entity_id, color);
+      const trail = new Trail(color); this.trails.set(m.entity_id, trail); this.scene.add(trail.line);
+      const label = makeLabel(m.entity_id, "#" + color.getHexString()); label.position.set(0, 0, 0.6);
+      group.add(label); this.labels.set(m.entity_id, label);
+      if (m.is_agent) {
+        const arrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1, 0x2ab1ff, 0.3, 0.15);
+        arrow.visible = false; this.scene.add(arrow); this.arrows.set(m.entity_id, arrow);
+        const ax = new THREE.AxesHelper(0.8); group.add(ax); this.axes.set(m.entity_id, ax);
+        const cam = info?.observation_space.frames.find(f => f.type === "rgb");
+        if (cam) { const fr = makeFrustum(cam.hfov, cam.width / cam.height); group.add(fr); this.frustums.set(m.entity_id, fr); }
+      }
+    }
   }
 
-  updatePoses(poses: Record<string, number[]>) {
+  updatePoses(poses: Record<string, number[]>, vel: Record<string, number[]>) {
     for (const [id, p] of Object.entries(poses)) {
-      const g = this.models.get(id);
-      if (!g) continue;
-      g.position.set(p[0], p[1], p[2]);
-      g.quaternion.set(p[3], p[4], p[5], p[6]);
+      const g = this.models.get(id); if (!g) continue;
+      g.position.set(p[0], p[1], p[2]); g.quaternion.set(p[3], p[4], p[5], p[6]);
+      const t = this.trails.get(id); if (t && this.overlays.trails) t.push(g.position);
+      const a = this.arrows.get(id); const v = vel[id];
+      if (a && v) {
+        const len = Math.hypot(v[0], v[1], v[2]);
+        a.visible = this.overlays.velocity && len > 0.05;
+        if (a.visible) { a.position.copy(g.position); a.setDirection(new THREE.Vector3(v[0], v[1], v[2]).normalize()); a.setLength(Math.min(len, 8), 0.3, 0.15); }
+      }
     }
     this.selBox?.update();
+    const now = performance.now();
+    this.collisionMarks = this.collisionMarks.filter(({ m, t }) => {
+      const age = (now - t) / 1000;
+      if (age > 4) { this.scene.remove(m); return false; }
+      (m.material as THREE.MeshBasicMaterial).opacity = 0.9 * (1 - age / 4); m.scale.setScalar(1 + age * 0.5);
+      return true;
+    });
+  }
+
+  markCollision(p: { x: number; y: number; z: number } | null) {
+    if (!p || !this.overlays.collisions) return;
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.5, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff3b3b, transparent: true, opacity: 0.9 }));
+    m.position.set(p.x, p.y, p.z); this.scene.add(m); this.collisionMarks.push({ m, t: performance.now() });
+  }
+
+  clearTrails() { for (const t of this.trails.values()) t.clear(); }
+
+  applyOverlays() {
+    const o = this.overlays;
+    for (const t of this.trails.values()) t.line.visible = o.trails;
+    for (const l of this.labels.values()) l.visible = o.labels;
+    for (const a of this.axes.values()) a.visible = o.axes;
+    for (const f of this.frustums.values()) f.visible = o.frustum;
+    for (const c of this.collisionGeoms) c.visible = o.collisionGeom;
+    if (this.boundsBox) this.boundsBox.visible = o.bounds;
+    if (!o.velocity) for (const a of this.arrows.values()) a.visible = false;
   }
 
   select(id: string | null) {
     this.selectedId = id;
     if (this.selBox) { this.scene.remove(this.selBox); this.selBox = null; }
     const g = id ? this.models.get(id) : undefined;
-    if (g) {
-      this.selBox = new THREE.BoxHelper(g, 0x2ab1ff);
-      this.scene.add(this.selBox);
-    }
+    if (g) { this.selBox = new THREE.BoxHelper(g, 0x2ab1ff); this.scene.add(this.selBox); }
   }
 
   pick(raycaster: THREE.Raycaster): string | null {
@@ -90,9 +201,22 @@ function applyPose(o: THREE.Object3D, p: Pose) {
   o.quaternion.set(p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
 }
 
+function makeFrustum(hfov: number, aspect: number): THREE.LineSegments {
+  // camera sits at (0.12, 0, -0.02) pitched 0.35 rad down, looking along +x (Gazebo optical convention)
+  const d = 3; const hw = Math.tan(hfov / 2) * d; const hh = hw / aspect;
+  const pts: number[] = []; const o = [0, 0, 0];
+  const corners = [[d, hw, hh], [d, -hw, hh], [d, -hw, -hh], [d, hw, -hh]];
+  for (const c of corners) pts.push(...o, ...c);
+  for (let i = 0; i < 4; i++) pts.push(...corners[i], ...corners[(i + 1) % 4]);
+  const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+  const ls = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.7 }));
+  ls.position.set(0.12, 0, -0.02); ls.rotation.y = 0.35;
+  return ls;
+}
+
 function makeVisual(v: Visual, m: ModelDesc): THREE.Object3D | null {
   const g = v.geometry;
-  let geom: THREE.BufferGeometry | null = null;
+  let geom: THREE.BufferGeometry;
   switch (g.type) {
     case "box": geom = new THREE.BoxGeometry(g.size!.x, g.size!.y, g.size!.z); break;
     case "cylinder": geom = new THREE.CylinderGeometry(g.radius!, g.radius!, g.length!, 32).rotateX(Math.PI / 2); break;
@@ -102,14 +226,11 @@ function makeVisual(v: Visual, m: ModelDesc): THREE.Object3D | null {
   }
   const c = v.color ?? [0.6, 0.6, 0.6, 1];
   const color = new THREE.Color(c[0], c[1], c[2]);
-  const mat = new THREE.MeshStandardMaterial({
-    color, roughness: m.is_agent ? 0.45 : 0.85, metalness: m.is_agent ? 0.25 : 0.05,
-    transparent: c[3] < 1, opacity: c[3],
-  });
-  if (m.is_agent) mat.emissive = color.clone().multiplyScalar(0.12);
+  const dyn = m.is_agent || m.kind === "target" || m.kind === "vehicle";
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: dyn ? 0.45 : 0.85, metalness: dyn ? 0.25 : 0.05, transparent: c[3] < 1, opacity: c[3] });
+  if (dyn) mat.emissive = color.clone().multiplyScalar(0.15);
   const mesh = new THREE.Mesh(geom, mat);
-  mesh.castShadow = g.type !== "plane";
-  mesh.receiveShadow = true;
+  mesh.castShadow = g.type !== "plane"; mesh.receiveShadow = true;
   applyPose(mesh, v.pose);
   return mesh;
 }

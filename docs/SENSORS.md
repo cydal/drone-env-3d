@@ -12,14 +12,21 @@ touches Gazebo topics directly.
 | RGB camera | `gz::sim::systems::Sensors` (ogre2) | `/<agent>/camera` (`gz.msgs.Image`) | `GET /agents/{id}/sensors/camera` |
 | Depth camera | `gz::sim::systems::Sensors` (ogre2) | `/<agent>/depth` (R_FLOAT32) | `GET /agents/{id}/sensors/depth` |
 
-## Rendering sensors on macOS
+## Rendering sensors on macOS — verified working
 
-Camera/depth need the Sensors system with a render engine. Gazebo's
-`--headless-rendering` is EGL-based and Linux-only; on macOS the server can
-still render via Metal when a display session exists, but this is untested
-here. The vertical slice therefore enables cameras only when a scenario agent
-sets `sensors: {camera: {...}}`; the world then loads the Sensors system.
-Physics, IMU, NavSat and odometry never need rendering and work fully headless.
+Camera/depth need the Sensors system (`ogre2`). **Tested on macOS 26 / Apple
+Silicon with Gazebo Jetty:** `gz sim -s --headless-rendering` renders camera
+and depth sensors correctly (Metal backend; ~0.15 s init). Without the flag it
+also works but rendering init takes ~6 s. Cameras are attached when a scenario
+agent has a `camera:` block; the world then loads the Sensors system.
 
-For batch/remote runs with cameras, plan on Linux (native or a `ros:lyrical`
-arm64 container with `ros-lyrical-ros-gz`).
+Observed throughput on an M-series laptop: ~6–7 fps per 320×240 camera at a
+configured 15 Hz while physics runs at real time. Reset with cameras attached
+costs ~3 s (rendering re-initialises). Physics, IMU, NavSat, contacts and
+odometry never need rendering.
+
+| Sensor | Gazebo system plugin (world) | Gazebo topic | API surface |
+|---|---|---|---|
+| Contact | `gz::sim::systems::Contact` | `/<agent>/contacts` | `collision` / `landing` / `takeoff` events, `observation.grounded` |
+| NavSat | `gz::sim::systems::NavSat` | `/<agent>/navsat` | `observation.gps` (profiles with `gps`) |
+| RGB / depth | `gz::sim::systems::Sensors` | `/<agent>/camera`, `/<agent>/depth` | `observation.frames[]` refs; `GET /agents/{id}/sensors/{name}`; `WS /ws/sensors/{id}/{name}` |

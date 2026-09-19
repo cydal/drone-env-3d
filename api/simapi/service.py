@@ -28,6 +28,12 @@ log = logging.getLogger(__name__)
 
 WAYPOINT_GAIN = 1.2
 REALTIME_TICK_HZ = 20.0
+# gz-transport drops messages published before discovery has connected a (re)created
+# subscriber. After start/reset we wait this long before accepting actions, and we
+# re-send each agent's latched command on every step so a dropped message costs at
+# most one step instead of a silently ignored action.
+SETTLE_S = 0.4
+SUBSTEP_ITERS = 25          # 0.1 s at the default 4 ms step
 
 
 class ActionError(ValueError):
@@ -100,6 +106,7 @@ class SimulationService:
         self.scenario = scenario
         await self.engine.start(scenario, seed=seed)
         self.agents = {a.id: AgentRuntime(a, comps[a.id]) for a in scenario.agents}
+        await asyncio.sleep(SETTLE_S)      # let controller systems discover our command publishers
         for rt in self.agents.values():
             if ("camera" in rt.components or "depth" in rt.components) and rt.spec.camera is None:
                 log.warning("agent %s: profile needs camera frames but no camera is configured", rt.spec.id)
@@ -136,6 +143,7 @@ class SimulationService:
             if self.mode == "stepped":
                 await self.engine.pause()
             await self.engine.reset()
+            await asyncio.sleep(SETTLE_S)  # Gazebo re-creates systems on reset; see SETTLE_S
             for rt in self.agents.values():
                 rt.last_action = None
                 rt.waypoint = None
@@ -222,11 +230,19 @@ class SimulationService:
             except ActionError as e:
                 rejected[aid] = str(e)
         seq_before = self._last_step_seq   # events since the previous step response
-        dt_s = self.scenario.simulation.step_size * steps
+        dt = self.scenario.simulation.step_size
         t_now = self.engine.status().sim_time
-        self._place_entities(t_now + dt_s)          # applied on the first iteration of this step
-        self._run_waypoint_controllers()
-        await self.engine.step(steps)
+        # Environment-driven entities are placed kinematically; chunk long steps so they
+        # move continuously (every SUBSTEP iterations) instead of teleporting once.
+        chunk = SUBSTEP_ITERS if self._trajectories.entities else steps
+        done = 0
+        while done < steps:
+            n = min(chunk, steps - done)
+            self._place_entities(t_now + (done + n) * dt)   # applied on the first iteration of this chunk
+            if done == 0:
+                self._run_waypoint_controllers()
+            await self.engine.step(n)
+            done += n
         if self.episode:
             self.episode.step_count += 1
         self._check_bounds_and_timeout()
@@ -438,9 +454,14 @@ class SimulationService:
         self._apply_action(agent_id, action)
 
     def _run_waypoint_controllers(self) -> None:
+        """Per-step re-issue of every agent's current command (latching)."""
         for aid, rt in self.agents.items():
             if rt.waypoint is not None:
                 self._drive_waypoint(aid, rt)
+            elif isinstance(rt.last_action, VelocityAction):
+                self.engine.send_velocity(aid, rt.last_action)
+            elif isinstance(rt.last_action, HoldAction):
+                self.engine.send_velocity(aid, VelocityAction())
 
     def _drive_waypoint(self, agent_id: str, rt: AgentRuntime) -> None:
         """Environment-side P controller: waypoint -> world-frame velocity setpoint."""
@@ -550,8 +571,8 @@ class SimulationService:
             try:
                 st = self.engine.status()
                 self._hz_samples.append((time.monotonic(), st.iterations))
-                if not st.running or st.paused:
-                    continue
+                if not st.running or st.paused or self.mode == "stepped":
+                    continue   # in stepped mode everything happens inside step(); never race it
                 # free-running: drive environment entities and waypoint controllers
                 self._place_entities(st.sim_time + period * max(st.real_time_factor, 0.5))
                 self._run_waypoint_controllers()

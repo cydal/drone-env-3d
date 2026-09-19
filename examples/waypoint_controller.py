@@ -1,105 +1,61 @@
-"""Integration test controller (Phase 1D): take off -> waypoint -> hover -> land.
+"""Controller 2 — Waypoint (stepped mode): take off -> waypoint -> hover -> land.
 
-Knows nothing about Gazebo. Talks only to the Simulation API through SimulationClient.
-Run:  python examples/waypoint_controller.py [--agent drone_01] [--scenario test_city_two_drones]
+The controller is *external*: it reads observations, computes body-frame
+velocities itself and advances the simulation step by step. Nothing here knows
+about Gazebo.
 """
 from __future__ import annotations
 
-import argparse
 import math
-import sys
-import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "client"))
-from simclient import SimulationClient  # noqa: E402
+from _common import connect, fmt, p_control, parser
 
 
-def pos(obs) -> tuple[float, float, float]:
-    p = obs["state"]["pose"]["position"]
-    return p["x"], p["y"], p["z"]
-
-
-def yaw_of(obs) -> float:
-    q = obs["state"]["pose"]["orientation"]
-    return math.atan2(2 * (q["w"] * q["z"] + q["x"] * q["y"]), 1 - 2 * (q["y"] ** 2 + q["z"] ** 2))
-
-
-def world_to_body(vx: float, vy: float, yaw: float) -> tuple[float, float]:
+def body_frame(vx, vy, yaw):
     c, s = math.cos(yaw), math.sin(yaw)
     return c * vx + s * vy, -s * vx + c * vy
 
 
-def fly_to(sim: SimulationClient, agent: str, target, *, speed=2.0, tol=0.35, timeout=60.0, log=print) -> bool:
-    """Proportional velocity controller toward a world-frame target position."""
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        obs = sim.get_observation(agent)
-        x, y, z = pos(obs)
-        dx, dy, dz = target[0] - x, target[1] - y, target[2] - z
-        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+def fly_to(sim, agent, target, *, speed=2.0, tol=0.35, max_steps=400, steps_per_action=25):
+    obs = sim.observe(agent)
+    for _ in range(max_steps):
+        vx, vy, vz, dist = p_control(obs.position, target, speed=speed)
         if dist < tol:
-            return True
-        gain = 1.2
-        vx, vy, vz = gain * dx, gain * dy, gain * dz
-        norm = math.sqrt(vx * vx + vy * vy + vz * vz)
-        if norm > speed:
-            vx, vy, vz = (v * speed / norm for v in (vx, vy, vz))
-        bx, by = world_to_body(vx, vy, yaw_of(obs))
-        sim.send_velocity(agent, vx=bx, vy=by, vz=vz, yaw_rate=0.0)
-        time.sleep(0.05)
-    return False
-
-
-def hover(sim: SimulationClient, agent: str, seconds: float) -> None:
-    t0 = time.time()
-    while time.time() - t0 < seconds:
-        sim.send_velocity(agent)  # zero twist = hold position
-        time.sleep(0.1)
+            return True, obs
+        bx, by = body_frame(vx, vy, obs.yaw)
+        res = sim.step(agent=agent, action=sim.velocity(bx, by, vz), steps=steps_per_action)
+        obs = res.observations[agent]
+    return False, obs
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="localhost")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--agent", default="drone_01")
-    ap.add_argument("--scenario", default=None, help="load this scenario first (otherwise use the running one)")
-    ap.add_argument("--waypoint", default="8,4,6", help="x,y,z of the waypoint")
-    args = ap.parse_args()
-
-    sim = SimulationClient(args.host, args.port)
-    if args.scenario:
-        print(f"loading scenario {args.scenario}")
-        sim.load_scenario(args.scenario)
-    sim.wait_until_ready()
-    sim.resume()
-
-    start = pos(sim.get_observation(args.agent))
-    wp = tuple(float(v) for v in args.waypoint.split(","))
-    print(f"[{args.agent}] start at {tuple(round(v, 2) for v in start)}")
-
-    sim.arm(args.agent, True)
-    steps = [
-        ("take off", (start[0], start[1], 4.0)),
-        ("to waypoint", wp),
-    ]
-    for label, target in steps:
-        print(f"[{args.agent}] {label} -> {target}")
-        if not fly_to(sim, args.agent, target):
-            print("  timeout"); return 1
-        print(f"  reached  ({tuple(round(v, 2) for v in pos(sim.get_observation(args.agent)))})")
-
-    print(f"[{args.agent}] hover 3 s")
-    hover(sim, args.agent, 3.0)
-
-    print(f"[{args.agent}] land")
-    fly_to(sim, args.agent, (wp[0], wp[1], 0.6), speed=1.0, tol=0.25)
-    fly_to(sim, args.agent, (wp[0], wp[1], 0.15), speed=0.5, tol=0.12, timeout=15)
-    sim.arm(args.agent, False)  # motors off
-    time.sleep(1.0)
-    final = pos(sim.get_observation(args.agent))
-    print(f"[{args.agent}] landed at {tuple(round(v, 2) for v in final)}")
+    ap = parser("waypoint test (stepped)"); ap.add_argument("--agent", default="drone_01")
+    ap.add_argument("--waypoint", default="8,4,6")
+    a = ap.parse_args()
+    sim = connect(a)
+    ep = sim.reset(scenario=a.scenario, seed=a.seed, mode="stepped") if not a.no_reset else sim.set_mode("stepped") and sim.episode()
+    print("episode", ep.episode_id, "mode", ep.mode)
+    obs = sim.observe(a.agent)
+    if obs.position is None:
+        print("agent profile does not expose state; this controller needs the 'state' profile"); return 2
+    start = obs.position
+    wp = tuple(float(v) for v in a.waypoint.split(","))
+    print(f"[{a.agent}] start {fmt(start)}")
+    for label, tgt, spd in (("take off", (start[0], start[1], 4.0), 2.0), ("to waypoint", wp, 2.5)):
+        ok, obs = fly_to(sim, a.agent, tgt, speed=spd)
+        print(f"[{a.agent}] {label} -> {fmt(tgt)}: {'reached' if ok else 'TIMEOUT'} at {fmt(obs.position)} (t={obs.sim_time:.2f}s)")
+        if not ok:
+            return 1
+    for _ in range(12):
+        res = sim.step(agent=a.agent, action=sim.hold(), steps=25)
+    print(f"[{a.agent}] hovered 1.2 s at {fmt(res.observations[a.agent].position)}")
+    ok, obs = fly_to(sim, a.agent, (wp[0], wp[1], 0.6), speed=1.0, tol=0.25)
+    ok, obs = fly_to(sim, a.agent, (wp[0], wp[1], 0.12), speed=0.5, tol=0.12, max_steps=200)
+    res = sim.step(agent=a.agent, action=sim.arm(False), steps=125)
+    final = res.observations[a.agent].position
+    landed = [e for e in sim.events() if e.event == "landing"]
     ok = math.hypot(final[0] - wp[0], final[1] - wp[1]) < 1.0 and final[2] < 0.5
+    print(f"[{a.agent}] landed at {fmt(final)}; landing events: {len(landed)}; steps={res.episode.step_count}")
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

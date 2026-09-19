@@ -162,6 +162,69 @@ lsof -nP -iTCP:8000 -iTCP:5173 -sTCP:LISTEN
 | `address already in use` on port 8000/5173 | a previous server process wasn't stopped | run the cleanup commands above, then re-check with `lsof` |
 | Browser shows nothing after Load | scenario hasn't finished spawning yet (first `gz sim` launch after a fresh install can take ~20s; later launches are ~3s) | wait a few seconds, check `runs/<latest>/gz-server.log` for errors |
 
+## Phase 2 — the environment loop
+
+Phase 2 turns the platform into an *environment*: observations in, actions out,
+episodes, events, two time modes. Full contract: [`docs/API.md`](docs/API.md).
+
+```python
+from simclient import Simulation            # client/ — HTTP only, no Gazebo knowledge
+
+sim = Simulation("localhost")
+episode = sim.reset(scenario="phase2_city", seed=42, mode="stepped")
+obs = sim.observe("drone_01")
+while not episode.done:
+    action = controller(obs)                # e.g. sim.velocity(vx=1.0, vz=0.5) or sim.waypoint(8, 4, 6)
+    result = sim.step(agent="drone_01", action=action, steps=25)   # exactly 25 physics iterations
+    obs, episode = result.observations["drone_01"], result.episode
+    for e in result.events: ...             # collision / landing / takeoff / out_of_bounds / timeout
+```
+
+Key ideas:
+
+* **Observation profiles** decide what an agent may see (`state`, `navigation`,
+  `vision`, `minimal`, `shared`, `central`, or scenario-defined). Ground truth
+  stays available separately at `/entities/{id}`.
+* **Actions** are validated (`velocity`, `waypoint`, `hold`, `arm`; limits per
+  agent); bad actions return 422 and never reach the simulator.
+* **Modes**: `realtime` (free-running, for humans) and `stepped` (advances only
+  on `step`, for RL/planning/datasets).
+* **Episodes** carry `episode_id / scenario / seed / mode / status`; every
+  episode logs `runs/<run>/episode_<id>.jsonl` (state, action, events per step).
+* **Events** are raw environment facts, not rewards.
+* **Dynamic entities** (a circling target, a patrolling vehicle) move on their
+  own along deterministic trajectories declared in the scenario.
+* **Sensors**: RGB + depth frames over HTTP or a binary WebSocket, the same
+  frames the browser shows.
+
+### Browser
+
+Realtime/Stepped toggle, play/pause/step/reset (seed box), entity list,
+telemetry with observation profile and control mode, events log with collision
+markers, Orbit/Follow/Top/FPV cameras, overlays (trails, velocity vectors, IDs,
+axes, camera frustum, collision geometry, bounds), RGB/depth sensor panel, a
+health strip (`/metrics`) and **manual keyboard flight** that goes through the
+same public action API as any Python controller (W/S/A/D, R/F, Q/E, X hold,
+Z arm/disarm; tick *Manual control* on a selected agent).
+
+### Example controllers (`examples/`)
+
+```bash
+.venv/bin/python examples/hover.py                 # climb + hold (realtime)
+.venv/bin/python examples/waypoint_controller.py   # external P controller, stepped
+.venv/bin/python examples/circle.py                # track a circular reference, stepped
+.venv/bin/python examples/formation.py             # three drones in a triangle, stepped
+.venv/bin/python examples/success_test.py          # brief 2 §29 checklist end to end
+```
+
+### Tests
+
+```bash
+.venv/bin/python -m pytest -q tests/test_api_fake_engine.py   # API contract, no Gazebo (fast)
+.venv/bin/python -m pytest -q tests/integration                # real Gazebo: lifecycle, agents,
+                                                               # reproducibility, collisions, frames (~3 min)
+```
+
 ## Status (2026-09-19) — vertical slice verified
 
 Gazebo → API → external Python controller → drone moves → browser sees it: **working.**

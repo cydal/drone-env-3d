@@ -42,19 +42,65 @@
   with a render engine; headless rendering via EGL is Linux-only, so on macOS
   image sensors are validated with a display attached (see docs/SENSORS.md).
 
-## Vertical slice (first milestone)
+## Vertical slice (first milestone, done)
 
 Gazebo → API → external Python controller → drone moves → browser sees it.
 
-## Stepping and determinism (current state)
+## Phase 2 layering
 
-* `POST /simulation/step {steps: N}` blocks until Gazebo has advanced exactly N
-  iterations and is paused again. With a fixed `step_size`, seed and scenario,
-  repeated `reset → actions → step(N)` sequences reproduce identical states.
-* Actions travel over gz-transport asynchronously, so `send_action` followed by
-  `step` has a tiny race window; the engine waits a few ms before stepping.
-  A strictly lock-stepped path (actions applied inside the step) is a Phase 2
-  item — candidates are `/world/<w>/control/state` (ECM state piggybacked on
-  the control message) or a small custom gz system.
+```
+simapi.app          HTTP/WS routes only; maps errors to 409/422
+simapi.service      the *environment*: episodes, modes, observation profiles,
+                    action validation, waypoint controller, trajectory controller,
+                    events, JSONL logging, metrics
+simapi.engine.base  what a simulator must provide (start/reset/step, poses,
+                    sensors, set_pose, send_velocity, callbacks)
+simapi.engine.gazebo Gazebo Jetty adapter (gz-transport, SDF generation, process)
+simclient           external client: Simulation / Episode / Observation / StepResult
+web/                browser: same public operations, plus rendering & debug overlays
+```
+
+Environment-owned intelligence is limited to two deterministic controllers:
+the waypoint P controller (agent level) and the trajectory controller
+(environment entities). Both run inside `step()` in stepped mode and on a 20 Hz
+tick in realtime mode; the tick is inert in stepped mode so nothing races a step.
+
+See `docs/API.md` for the agent contract, observation profiles, action space,
+stepping semantics, events and transports.
+
+## Stepping and determinism
+
+* `POST /simulation/step {steps: N, actions}` blocks until Gazebo has advanced
+  exactly N iterations and is paused again. Long steps are sub-stepped (25
+  iterations) when environment entities move, so they travel continuously.
+* Verified: identical `reset → act → step(401)` sequences reproduce positions to
+  7 decimals; resting contact jitter between resets is ~1e-7 m (DART floor).
+* **Service requests run in a separate process** (`engine/gazebo/reqworker.py`).
+  The gz-transport Python binding's `request()` blocks while holding the GIL,
+  and gz-transport's receive thread needs the GIL to deliver subscription
+  callbacks, so under the API's callback load every in-process request timed
+  out and froze the interpreter (measured 15/15). A worker process with its own
+  Node and no subscriptions answers in ~1 ms. Publishing stays in-process (it
+  never waits). Wall-clock throttling of subscriptions is deliberately *not*
+  used: observation freshness must depend on sim time only.
+* Poses are published every physics iteration (`dynamic_pose_hertz` ≥ 1/step)
+  and `step()` waits for the pose stamped with the final sim time, so the state
+  read after a step is exact, not "latest within a few ms".
+* Known transport hazards and their mitigations (all bit us during development):
+  - gz-transport drops messages published before discovery connects a freshly
+    (re)created subscriber → command publishers are advertised at agent attach,
+    a 0.4 s settle follows start/reset, and each agent's latched command is
+    re-sent every step.
+  - Gazebo reports *unpaused* while executing a multi-step → the realtime tick
+    is disabled in stepped mode; the desired pause state is tracked, not observed.
+  - A world reset is asynchronous → `reset` waits for the rewind to be observed
+    in world stats, retries once, and fails loudly instead of continuing.
+  - After a reset with cameras attached the server stalls ~3 s re-initialising
+    rendering → control requests use an 8 s timeout.
 * `reset` uses `WorldControl.reset.all`; Gazebo re-creates the systems, so the
-  multicopter controllers idle until the next command.
+  multicopter controllers idle until the next command. A different seed
+  relaunches the server (`--seed` is a launch parameter); physics itself is
+  deterministic, so the seed matters only for future noise/randomised scenarios.
+* A strictly lock-stepped path (actions applied *inside* the physics step via a
+  custom gz system) remains the Phase 3 upgrade if sub-millisecond action
+  timing ever matters.

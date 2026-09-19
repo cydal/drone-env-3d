@@ -42,6 +42,8 @@ def create_app(engine_factory=None) -> FastAPI:
     def _err(e: Exception) -> HTTPException:
         if isinstance(e, ActionError):
             return HTTPException(422, str(e))
+        if isinstance(e, TimeoutError):
+            return HTTPException(503, f"simulator did not respond: {e}")
         if isinstance(e, (RuntimeError, ValueError, FileNotFoundError)):
             return HTTPException(409, str(e))
         log.exception("unhandled")
@@ -112,7 +114,10 @@ def create_app(engine_factory=None) -> FastAPI:
 
     @app.post("/simulation/pause", response_model=SimStatus)
     async def pause():
-        return await service.pause()
+        try:
+            return await service.pause()
+        except Exception as e:
+            raise _err(e)
 
     @app.post("/simulation/resume", response_model=SimStatus)
     async def resume():
@@ -123,7 +128,10 @@ def create_app(engine_factory=None) -> FastAPI:
 
     @app.post("/simulation/mode", response_model=SimStatus)
     async def mode(req: ModeRequest):
-        return await service.set_mode(req.mode)
+        try:
+            return await service.set_mode(req.mode)
+        except Exception as e:
+            raise _err(e)
 
     @app.post("/simulation/step", response_model=StepResponse)
     async def step(req: StepRequest | None = None):

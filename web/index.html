@@ -10,25 +10,51 @@
   <div id="app">
     <header id="topbar">
       <div class="brand">ENV<span>·</span>DR3D</div>
+      <div id="scenario-box">
+        <select id="scenario-select"></select>
+        <button id="btn-load" title="Load scenario (new episode)">Load</button>
+      </div>
       <div id="sim-controls">
+        <div class="seg" id="mode-seg" title="Realtime: free-running · Stepped: advances only on Step">
+          <button data-mode="realtime" class="active">Realtime</button><button data-mode="stepped">Stepped</button>
+        </div>
         <button id="btn-play" title="Play/Pause (space)">▶</button>
-        <button id="btn-step" title="Step">⏭</button>
-        <button id="btn-reset" title="Reset">↺</button>
+        <button id="btn-step" title="Step N iterations">⏭ <span id="step-n">25</span></button>
+        <input id="step-input" type="number" min="1" max="10000" value="25" title="iterations per step" />
+        <button id="btn-reset" title="Reset episode (same seed unless set)">↺</button>
+        <input id="seed-input" type="number" placeholder="seed" title="seed for next reset (blank = keep)" />
+      </div>
+      <div id="clock">
         <span class="stat"><label>t</label><span id="sim-time">0.000</span>s</span>
         <span class="stat"><label>rtf</label><span id="rtf">0.00</span></span>
         <span class="stat"><label>iter</label><span id="iters">0</span></span>
+        <span class="stat"><label>ep</label><span id="ep-status">—</span></span>
         <span class="stat"><label>ws</label><span id="conn" class="dot"></span></span>
       </div>
-      <div id="scenario-box">
-        <select id="scenario-select"></select>
-        <button id="btn-load">Load</button>
-      </div>
     </header>
+
     <aside id="left">
       <h3>Entities</h3>
       <ul id="entity-list"></ul>
+      <h3 class="mt">Events <span id="ev-count" class="badge">0</span></h3>
+      <ul id="event-list" class="mono"></ul>
     </aside>
-    <main id="viewport"></main>
+
+    <main id="viewport">
+      <div id="overlay-chips">
+        <button data-ov="trails" class="on">Trails</button>
+        <button data-ov="velocity" class="on">Velocity</button>
+        <button data-ov="labels" class="on">IDs</button>
+        <button data-ov="axes">Axes</button>
+        <button data-ov="frustum">Frustum</button>
+        <button data-ov="collisions" class="on">Collisions</button>
+        <button data-ov="collisionGeom">Collision geom</button>
+        <button data-ov="bounds">Bounds</button>
+      </div>
+      <div id="health" class="mono"></div>
+      <div id="toast"></div>
+    </main>
+
     <aside id="right">
       <h3 id="sel-title">Telemetry</h3>
       <div id="telemetry" class="mono">select an entity</div>
@@ -36,6 +62,17 @@
         <button data-cam="orbit" class="active">Orbit</button>
         <button data-cam="follow">Follow</button>
         <button data-cam="top">Top</button>
+        <button data-cam="fpv">FPV</button>
+      </div>
+      <div id="manual" class="hidden">
+        <h3 class="mt">Manual control</h3>
+        <label class="toggle"><input type="checkbox" id="manual-toggle" /> keyboard → public action API</label>
+        <div class="keys mono">W/S fwd·back  A/D left·right<br/>R/F up·down    Q/E yaw<br/>X hold   Z arm/disarm</div>
+      </div>
+      <div id="sensors" class="hidden">
+        <h3 class="mt">Sensors <span id="sensor-fps" class="badge"></span></h3>
+        <img id="img-camera" alt="camera" /><div class="cap">RGB camera</div>
+        <img id="img-depth" alt="depth" /><div class="cap">Depth (colormap)</div>
       </div>
     </aside>
   </div>

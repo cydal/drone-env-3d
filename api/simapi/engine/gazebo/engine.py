@@ -121,6 +121,7 @@ class GazeboEngine(SimulationEngine):
         self._event_cb: Callable[[EngineEvent], None] | None = None
         self._stats_event = threading.Event()
         self._want_paused = True
+        self._last_pose_time = -1.0
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -211,24 +212,36 @@ class GazeboEngine(SimulationEngine):
             msg.multi_step = fields.pop("multi_step")
         if fields.pop("reset_all", False):
             msg.reset.all = True
-        self._request_retry(f"/world/{self.world}/control", msg, g["Boolean"], attempts=3)
+        # After a reset with rendering sensors the server can stall for several seconds
+        # while ogre2 re-initialises; keep the control timeout generous.
+        self._request_retry(f"/world/{self.world}/control", msg, g["Boolean"], attempts=3, timeout_ms=8000)
 
     async def reset(self) -> None:
+        """Rewind the world. Blocks until the rewind is *observed* in world stats;
+        retries once and raises if Gazebo never applies it (a silent no-op would make
+        an episode look reproducible while starting from the previous state)."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: self._control(reset_all=True))
+        await loop.run_in_executor(None, self._reset_blocking)
         with self._lock:
             for a in self._agents.values():
                 a.reset_transients()
-        # wait for iterations to read 0 so callers see a consistent state
-        await loop.run_in_executor(None, self._wait_iterations_reset)
 
-    def _wait_iterations_reset(self) -> None:
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            with self._lock:
-                if self._stats is not None and self._stats.iterations < 5:
+    def _reset_blocking(self) -> None:
+        with self._lock:
+            pre_iter = self._stats.iterations if self._stats else 0
+        if pre_iter == 0:
+            return                      # nothing has advanced yet; state is already initial
+        for attempt in range(2):
+            self._control(reset_all=True)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with self._lock:
+                    it = self._stats.iterations if self._stats else pre_iter
+                if it < pre_iter:
                     return
-            time.sleep(0.01)
+                time.sleep(0.01)
+            log.warning("reset not observed (iterations still %s), retrying", it)
+        raise RuntimeError("Gazebo did not apply the world reset")
 
     async def pause(self) -> None:
         await asyncio.get_running_loop().run_in_executor(None, lambda: self._set_paused(True))
@@ -262,10 +275,22 @@ class GazeboEngine(SimulationEngine):
             with self._lock:
                 it = self._stats.iterations if self._stats else 0
                 paused = self._stats.paused if self._stats else False
+                final_t = _t(self._stats.sim_time) if self._stats else 0.0
             if it >= target and paused:
-                return
-            time.sleep(0.005)
-        log.warning("step(%d) did not complete in time (at %s/%s)", steps, it, target)
+                break
+            time.sleep(0.002)
+        else:
+            log.warning("step(%d) did not complete in time (at %s/%s)", steps, it, target)
+            return
+        # Poses are published every iteration; wait until the pose stamped with the final
+        # sim time has been delivered so entity_state() reflects exactly the stepped state.
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._last_pose_time >= final_t - 1e-9:
+                    return
+            time.sleep(0.001)
+        log.warning("final pose for t=%.4f not received (last %.4f)", final_t, self._last_pose_time)
 
     def status(self) -> SimStatus:
         with self._lock:
@@ -299,6 +324,7 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             sim_time = _t(msg.header.stamp) if msg.HasField("header") else (
                 _t(self._stats.sim_time) if self._stats else 0.0)
+            self._last_pose_time = sim_time
             changed: dict[str, Pose] = {}
             for p in msg.pose:
                 name = self._model_ids.get(p.id)
@@ -418,12 +444,27 @@ class GazeboEngine(SimulationEngine):
             for m in scene.model:
                 self._poses.setdefault(m.name, _pose_from_msg(m.pose))
 
+    async def _wait_for_model(self, entity_id: str, *, present: bool, timeout: float = 5.0) -> None:
+        """UserCommands are executed on the server's next update; poll the scene until
+        the entity (dis)appears instead of guessing a delay."""
+        deadline = time.time() + timeout
+        while True:
+            await self._refresh_scene()
+            with self._lock:
+                found = entity_id in self._model_ids.values()
+            if found == present:
+                return
+            if time.time() > deadline:
+                raise TimeoutError(f"entity {entity_id!r} did not {'appear' if present else 'disappear'} in time")
+            await asyncio.sleep(0.1)
+
     def _attach_agent(self, agent_id: str, camera: CameraSpec | None) -> None:
         g = self.tp.g
         io = _AgentIO(agent_id, camera)
         with self._lock:
             self._agents[agent_id] = io
             self._kinds.setdefault(agent_id, "drone")
+        # No wall-clock throttling: observation freshness must be a function of sim time only.
         self.tp.subscribe(g["Odometry"], f"/model/{agent_id}/odometry", self._make_odom_cb(io))
         self.tp.subscribe(g["IMU"], f"/{agent_id}/imu", self._make_store_cb(io, "imu"))
         self.tp.subscribe(g["NavSat"], f"/{agent_id}/navsat", self._make_store_cb(io, "navsat"))
@@ -575,8 +616,7 @@ class GazeboEngine(SimulationEngine):
         self._fill_pose(req.pose, pose)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/create", req, g["Boolean"]))
-        await asyncio.sleep(0.3)
-        await self._refresh_scene()
+        await self._wait_for_model(entity_id, present=True)
         with self._lock:
             self._kinds[entity_id] = "drone" if is_agent else ("vehicle" if template == "vehicle" else "target")
         if is_agent and entity_id in self._model_ids.values():
@@ -595,8 +635,7 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             self._poses.pop(entity_id, None)
             self._kinds.pop(entity_id, None)
-        await asyncio.sleep(0.3)
-        await self._refresh_scene()
+        await self._wait_for_model(entity_id, present=False)
 
     def set_pose(self, entity_id: str, pose: Pose) -> None:
         g = self.tp.g
@@ -605,9 +644,9 @@ class GazeboEngine(SimulationEngine):
         self._fill_pose(msg, pose)
         # non-blocking variant: enqueued, applied on the next iteration
         try:
-            self.tp.request(f"/world/{self.world}/set_pose", msg, g["Boolean"], 500)
+            self.tp.request(f"/world/{self.world}/set_pose", msg, g["Boolean"], 2000)
         except TimeoutError:
-            log.debug("set_pose timed out for %s", entity_id)
+            log.warning("set_pose timed out for %s", entity_id)
 
     # ------------------------------------------------------------------ actions
     def send_velocity(self, agent_id: str, action: VelocityAction) -> None:

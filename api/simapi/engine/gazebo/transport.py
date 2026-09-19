@@ -1,7 +1,9 @@
 """Thin wrapper over the gz-transport Python bindings (Gazebo Jetty: gz.transport / gz.msgs).
 
-Imports are done lazily so the rest of the API can be imported (and unit
-tested) on machines without Gazebo.
+Subscriptions and publishing live in this process; *service requests* are
+delegated to `RequestWorker` (separate process) — see reqworker.py for why.
+Imports are lazy so the rest of the API can be imported (and unit tested) on
+machines without Gazebo.
 """
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ import os
 import threading
 from typing import Any, Callable
 
-# All processes (this API and the gz sim server) must share a partition.
+# All processes (this API, the request worker and the gz sim server) share a partition.
 os.environ.setdefault("GZ_PARTITION", "envdr3d")
 
 _import_lock = threading.Lock()
@@ -21,7 +23,7 @@ def gz() -> dict[str, Any]:
     with _import_lock:
         if _gz:
             return _gz
-        from gz.transport import Node  # Jetty (gz-transport15) — unsuffixed module
+        from gz.transport import Node, SubscribeOptions  # Jetty (gz-transport15): unsuffixed module
         from gz.msgs.boolean_pb2 import Boolean
         from gz.msgs.contacts_pb2 import Contacts
         from gz.msgs.empty_pb2 import Empty
@@ -39,9 +41,9 @@ def gz() -> dict[str, Any]:
         from gz.msgs.world_control_pb2 import WorldControl
         from gz.msgs.world_stats_pb2 import WorldStatistics
         _gz.update(dict(
-            Node=Node, Boolean=Boolean, Contacts=Contacts, Empty=Empty, EntityFactory=EntityFactory, Entity=Entity,
-            Image=Image, IMU=IMU, NavSat=NavSat, Odometry=Odometry, Pose=Pose, Pose_V=Pose_V,
-            Scene=Scene, StringMsg_V=StringMsg_V, Twist=Twist, WorldControl=WorldControl,
+            Node=Node, SubscribeOptions=SubscribeOptions, Boolean=Boolean, Contacts=Contacts, Empty=Empty,
+            EntityFactory=EntityFactory, Entity=Entity, Image=Image, IMU=IMU, NavSat=NavSat, Odometry=Odometry,
+            Pose=Pose, Pose_V=Pose_V, Scene=Scene, StringMsg_V=StringMsg_V, Twist=Twist, WorldControl=WorldControl,
             WorldStatistics=WorldStatistics,
         ))
         return _gz
@@ -49,13 +51,21 @@ def gz() -> dict[str, Any]:
 
 class Transport:
     def __init__(self) -> None:
+        from .reqworker import RequestWorker
         self.g = gz()
         self.node = self.g["Node"]()
         self._pubs: dict[str, Any] = {}
         self._subs: set[str] = set()
+        self._worker = RequestWorker(os.environ["GZ_PARTITION"])
 
-    def subscribe(self, msg_cls, topic: str, cb: Callable[[Any], None]) -> bool:
-        ok = self.node.subscribe(msg_cls, topic, cb)
+    def subscribe(self, msg_cls, topic: str, cb: Callable[[Any], None], *, max_hz: float | None = None) -> bool:
+        """Subscribe; `max_hz` throttles in C++ before the Python callback runs."""
+        if max_hz:
+            opts = self.g["SubscribeOptions"]()
+            opts.msgs_per_sec = int(max_hz)
+            ok = self.node.subscribe(msg_cls, topic, cb, opts)
+        else:
+            ok = self.node.subscribe(msg_cls, topic, cb)
         if ok:
             self._subs.add(topic)
         return ok
@@ -78,18 +88,16 @@ class Transport:
         return bool(self.publisher(topic, type(msg)).publish(msg))
 
     def request(self, service: str, req, rep_cls, timeout_ms: int = 5000):
-        ok, rep = self.node.request(service, req, type(req), rep_cls, timeout_ms)
-        if not ok:
-            raise TimeoutError(f"service call failed/timed out: {service}")
-        return rep
+        return self._worker.request(service, req, rep_cls, timeout_ms)
 
     def service_list(self) -> list[str]:
-        return list(self.node.service_list())
+        return self._worker.service_list()
 
     def topic_list(self) -> list[str]:
-        return list(self.node.topic_list())
+        return self._worker.topic_list()
 
     def close(self) -> None:
         for t in list(self._subs):
             self.unsubscribe(t)
         self._pubs.clear()
+        self._worker.close()
