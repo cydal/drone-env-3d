@@ -222,11 +222,12 @@ class Simulation:
         return self._get(f"/entities/{entity_id}")
 
     def spawn(self, entity_id: str, *, template: str = "quadcopter", position=(0.0, 0.0, 0.0),
-              observation: str | None = None, **params) -> None:
+              observation: str | None = None, camera: dict[str, Any] | None = None, **params) -> None:
+        """Spawn an entity. `camera={...}` attaches RGB(+depth) sensors (world must have rendering)."""
         x, y, z = position
         self._post("/entities", {"entity_id": entity_id, "template": template,
                                  "pose": {"position": {"x": x, "y": y, "z": z}}, "params": params,
-                                 "observation": observation})
+                                 "observation": observation, "camera": camera})
 
     def remove(self, entity_id: str) -> None:
         r = self._http.delete(f"/entities/{entity_id}")

@@ -138,6 +138,13 @@ Status: `created → running/paused → completed | terminated | failed`.
 Episodes end on `timeout` (`episode.max_sim_time`) or on any event listed in
 `episode.terminate_on`; the world pauses and further steps return 409 until reset.
 
+Entities spawned at runtime (`POST /entities`) belong to the *current* episode
+only: `reset` removes them before rewinding (save the scenario to make them
+permanent). Removing an entity advances the world by 2 iterations in stepped
+mode (a Gazebo workaround, see ARCHITECTURE.md). If the simulator process dies,
+the episode becomes `failed`, a `simulator_crashed` event is emitted and the
+next `reset` relaunches the scenario.
+
 ## Events
 
 `GET /events?since=<seq>`; also pushed on `/ws` and attached to step responses.

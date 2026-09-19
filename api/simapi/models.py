@@ -342,6 +342,7 @@ class SpawnRequest(BaseModel):
     pose: Pose = Field(default_factory=Pose)
     params: dict[str, Any] = Field(default_factory=dict)
     observation: str | None = None               # profile name for agents
+    camera: dict[str, Any] | None = None         # CameraSpec fields; needs a world with rendering enabled
 
 
 class Metrics(BaseModel):

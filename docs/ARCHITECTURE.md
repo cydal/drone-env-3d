@@ -86,6 +86,16 @@ stepping semantics, events and transports.
 * Poses are published every physics iteration (`dynamic_pose_hertz` ≥ 1/step)
   and `step()` waits for the pose stamped with the final sim time, so the state
   read after a step is exact, not "latest within a few ms".
+* **Gazebo bug worked around:** gz-sim 10.5 / gz-physics dartsim segfaults in
+  `SimulationFeatures::GetContactsFromLastStep` when a body that was in contact
+  during the last physics step is deleted — directly via `/remove`, or
+  implicitly when a world rewind discards runtime-spawned models. The engine
+  therefore lifts a body to z=500 and runs two iterations before deleting it,
+  and `reset` removes runtime-spawned entities this way *before* rewinding.
+  Runtime-spawned entities are thus not part of an episode's initial state;
+  save the scenario to keep them. If the server does die, `status.running`
+  turns false, the episode is marked `failed` with a `simulator_crashed` event,
+  and the next `reset` relaunches it.
 * Known transport hazards and their mitigations (all bit us during development):
   - gz-transport drops messages published before discovery connects a freshly
     (re)created subscriber → command publishers are advertised at agent attach,

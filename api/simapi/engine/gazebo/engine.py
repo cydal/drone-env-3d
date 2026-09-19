@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 LANDING_SURFACES = ("ground", "pad_")       # contact with these = landing/takeoff, not collision
 CONTACT_COOLDOWN_S = 0.5                    # sim seconds before the same pair re-emits a collision
 GROUND_CONTACT_TIMEOUT_S = 0.35             # sim seconds without ground contact -> airborne
+SAFE_REMOVAL_Z = 500.0                      # bodies are lifted here before deletion (see remove())
 
 
 def _t(msg_time) -> float:
@@ -176,9 +177,15 @@ class GazeboEngine(SimulationEngine):
                 return
         raise TimeoutError(f"world '{self.world}' never became ready:\n" + self.proc.tail_log())
 
+    @property
+    def crash_log(self) -> str:
+        return self.proc.tail_log(12)
+
     def _request_retry(self, service: str, req, rep_cls, *, attempts: int = 5, timeout_ms: int = 2000):
         last: Exception | None = None
         for _ in range(attempts):
+            if not self.proc.alive():
+                raise RuntimeError("gz sim is not running (crashed?); load a scenario again\n" + self.proc.tail_log(6))
             try:
                 return self.tp.request(service, req, rep_cls, timeout_ms)
             except TimeoutError as e:
@@ -624,11 +631,30 @@ class GazeboEngine(SimulationEngine):
         return is_agent
 
     async def remove(self, entity_id: str) -> None:
+        """Remove a model.
+
+        gz-sim 10.5 / dartsim segfaults (GetContactsFromLastStep) when a body that was in
+        contact during the last physics step is deleted — including implicitly during a
+        world rewind. Workaround: teleport the body well clear of everything and run two
+        iterations so the contact cache no longer references it, then delete. In stepped
+        mode this advances the world by 2 iterations; callers that reset afterwards do not
+        care, and callers that remove mid-episode get a documented 8 ms hiccup.
+        """
         g = self.tp.g
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            pose = self._poses.get(entity_id)
+            paused = self._stats.paused if self._stats else True
+        if pose is not None:
+            lifted = pose.model_copy(update={"position": Vec3(x=pose.position.x, y=pose.position.y, z=SAFE_REMOVAL_Z)})
+            await loop.run_in_executor(None, lambda: self.set_pose(entity_id, lifted))
+            if paused:
+                await loop.run_in_executor(None, self._step_blocking, 2)
+            else:
+                await asyncio.sleep(0.05)
         req = g["Entity"]()
         req.name = entity_id
         req.type = g["Entity"].MODEL
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/remove", req, g["Boolean"]))
         if entity_id in self._agents:
             self._detach_agent(entity_id)

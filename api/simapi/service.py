@@ -59,6 +59,7 @@ class SimulationService:
         self.episode: Episode | None = None
         self.mode: SimMode = "realtime"
         self.agents: dict[str, AgentRuntime] = {}
+        self._runtime_spawned: set[str] = set()   # not part of the scenario's initial state
         self.events: collections.deque[Event] = collections.deque(maxlen=5000)
         self._event_seq = 0
         self._events_total = 0
@@ -106,6 +107,7 @@ class SimulationService:
         self.scenario = scenario
         await self.engine.start(scenario, seed=seed)
         self.agents = {a.id: AgentRuntime(a, comps[a.id]) for a in scenario.agents}
+        self._runtime_spawned.clear()
         await asyncio.sleep(SETTLE_S)      # let controller systems discover our command publishers
         for rt in self.agents.values():
             if ("camera" in rt.components or "depth" in rt.components) and rt.spec.camera is None:
@@ -134,6 +136,10 @@ class SimulationService:
         elif seed is not None and seed != self.engine.seed:
             # seed is fixed at server launch -> relaunch the same scenario with the new seed
             await self.start(self.scenario, seed=seed, mode=mode or self.mode)
+        elif not self.engine.status().running:
+            # simulator process is gone (crashed or killed): a reset means "fresh episode", so relaunch
+            log.warning("simulator not running; relaunching scenario %s for reset", self.scenario.name)
+            await self.start(self.scenario, seed=seed if seed is not None else self.engine.seed, mode=mode or self.mode)
         else:
             await self._stop_tick()
             self._close_episode("terminated" if self.episode and self.episode.status == "running" else
@@ -142,6 +148,16 @@ class SimulationService:
                 self.mode = mode
             if self.mode == "stepped":
                 await self.engine.pause()
+            # Runtime-spawned entities are not part of the episode's initial state. They are
+            # removed *before* the rewind: rewinding while they exist crashes gz-sim 10.5
+            # (segfault in dartsim GetContactsFromLastStep). Save the scenario to keep them.
+            for eid in sorted(self._runtime_spawned):
+                self.agents.pop(eid, None)
+                try:
+                    await self.engine.remove(eid)
+                except Exception as e:
+                    log.warning("could not remove runtime entity %s before reset: %s", eid, e)
+            self._runtime_spawned.clear()
             await self.engine.reset()
             await asyncio.sleep(SETTLE_S)  # Gazebo re-creates systems on reset; see SETTLE_S
             for rt in self.agents.values():
@@ -191,7 +207,14 @@ class SimulationService:
         self.episode.sim_time = st.sim_time
         self.episode.iterations = st.iterations
         if self.episode.status in ("running", "paused"):
-            self.episode.status = "paused" if st.paused else "running"
+            if not st.running:                      # simulator process died
+                self.episode.status = "failed"
+                self._push_event("simulator_crashed", [], {"log": getattr(self.engine, "crash_log", "")})
+                if self._logger:
+                    self._logger.close("failed")
+                    self._logger = None
+            else:
+                self.episode.status = "paused" if st.paused else "running"
 
     # ======================================================================
     # lifecycle controls
@@ -304,22 +327,21 @@ class SimulationService:
         if entity_id in self.agents or any(e.entity_id == entity_id for e in self.engine.list_entities()):
             raise ValueError(f"entity {entity_id!r} already exists")
         is_agent = await self.engine.spawn(entity_id, template, pose, params, camera=camera)
+        self._runtime_spawned.add(entity_id)
         if is_agent:
             spec = AgentSpec(id=entity_id, template=template, spawn=pose, params=params,
                              observation=observation or "state", camera=camera)
             comps = resolve_profile(spec.observation, self.scenario.observation_profiles if self.scenario else None)
             self.agents[entity_id] = AgentRuntime(spec, comps)
-            if self.scenario:
-                self.scenario.agents.append(spec)
             self._push_event("agent_spawned", [entity_id], {"template": template})
         self.hub.publish_threadsafe({"type": "scene_changed"})
 
     async def remove(self, entity_id: str) -> None:
+        was_agent = entity_id in self.agents
+        self.agents.pop(entity_id, None)          # before the engine lifts it (no out_of_bounds event)
+        self._runtime_spawned.discard(entity_id)
         await self.engine.remove(entity_id)
-        if entity_id in self.agents:
-            self.agents.pop(entity_id)
-            if self.scenario:
-                self.scenario.agents = [a for a in self.scenario.agents if a.id != entity_id]
+        if was_agent:
             self._push_event("agent_removed", [entity_id], {})
         self.hub.publish_threadsafe({"type": "scene_changed"})
 

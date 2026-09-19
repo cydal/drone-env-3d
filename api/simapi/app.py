@@ -167,14 +167,19 @@ def create_app(engine_factory=None) -> FastAPI:
     async def spawn(req: SpawnRequest):
         _require_running(service)
         try:
-            await service.spawn(req.entity_id, req.template, req.pose, req.params, observation=req.observation)
+            from .scenario import CameraSpec
+            cam = CameraSpec.model_validate(req.camera) if req.camera is not None else None
+            await service.spawn(req.entity_id, req.template, req.pose, req.params, observation=req.observation, camera=cam)
         except Exception as e:
             raise _err(e)
         return {"spawned": req.entity_id}
 
     @app.delete("/entities/{entity_id}")
     async def remove(entity_id: str):
-        await service.remove(entity_id)
+        try:
+            await service.remove(entity_id)
+        except Exception as e:
+            raise _err(e)
         return {"removed": entity_id}
 
     # ---- agents -----------------------------------------------------------

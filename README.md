@@ -161,6 +161,8 @@ lsof -nP -iTCP:8000 -iTCP:5173 -sTCP:LISTEN
 | `pkill -f "python -m simapi"` doesn't kill anything | Homebrew's python@3.14 binary is capitalized (`Python`), so a lowercase pattern won't match | use `pkill -f "simapi"` instead (case-insensitive to the binary name) |
 | `address already in use` on port 8000/5173 | a previous server process wasn't stopped | run the cleanup commands above, then re-check with `lsof` |
 | Browser shows nothing after Load | scenario hasn't finished spawning yet (first `gz sim` launch after a fresh install can take ~20s; later launches are ~3s) | wait a few seconds, check `runs/<latest>/gz-server.log` for errors |
+| `status.running` is false, episode `failed`, event `simulator_crashed` | the Gazebo process died (its stack trace is in `runs/<latest>/gz-server.log`) | `POST /episode/reset` (or the ↺ button) relaunches the scenario automatically |
+| Reset with cameras attached takes ~3 s | Gazebo re-initialises the rendering system on every world rewind | expected; use a camera-less scenario for fast RL loops or batch resets |
 
 ## Phase 2 — the environment loop
 

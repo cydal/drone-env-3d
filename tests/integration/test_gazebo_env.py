@@ -130,3 +130,16 @@ def test_frames_available(sim):
     refs = sim.observe("drone_01").frames
     assert refs == []                         # state profile: no camera in observation
     sim.pause()
+
+
+def test_spawn_then_reset_does_not_crash_simulator(sim):
+    """Regression: rewinding with a runtime-spawned contact-sensor model crashed gz-sim
+    (dartsim GetContactsFromLastStep). Runtime entities are removed before the rewind."""
+    sim.reset(scenario="collision_test", seed=7, mode="stepped")
+    sim.spawn("extra", position=(3, 3, 0.2))
+    sim.step(steps=50)
+    ep = sim.reset(seed=7)
+    assert ep.status == "paused" and sim.status()["running"]
+    assert "extra" not in [a["agent_id"] for a in sim.agents()]       # not part of the initial state
+    r = sim.step(steps=10)
+    assert r.status["iterations"] == 10
