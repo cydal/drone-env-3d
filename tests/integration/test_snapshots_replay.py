@@ -45,10 +45,14 @@ def test_recording_rows_and_replay(sim):
     assert rows[1]["actions"]["drone_01"]["type"] == "velocity"
     meta = sim.recording(rec["recording_id"])
     assert meta["actions"] and meta["actions"][0]["action"]["type"] == "arm"
-    # perturb the world, then replay the recording -> identical final state
+    # keep flying (this is also recorded), then replay only up to iteration 126 -> the earlier state
     sim.step(actions={"drone_01": sim.velocity(-2.0, 1.0, 0.0)}, steps=100)
-    rep = sim.replay(rec["recording_id"])
+    perturbed = _pos(sim, "drone_01")
+    rep = sim.replay(rec["recording_id"], until_iteration=126)
     assert rep["replayed_to_iteration"] == 126 and _pos(sim, "drone_01") == final
+    # and a full replay reproduces the whole episode including the later actions
+    rep = sim.replay(rec["recording_id"])
+    assert rep["replayed_to_iteration"] == 226 and _pos(sim, "drone_01") == perturbed
 
 
 def test_world_state(sim):

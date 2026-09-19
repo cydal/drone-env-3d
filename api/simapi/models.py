@@ -56,6 +56,25 @@ class EntityInfo(BaseModel):
     pose: Pose = Field(default_factory=Pose)
 
 
+class EntityDetail(BaseModel):
+    """Everything the inspector (or an external tool) may want about one entity."""
+    entity_id: str
+    kind: EntityKind
+    category: str                              # drone | vehicle | target | building | infrastructure | obstacle | dynamic | terrain
+    is_agent: bool
+    is_static: bool
+    template: str | None = None
+    type_label: str | None = None              # e.g. "Quadrotor (light, agile)", "Ground vehicle", "Building"
+    dimensions: Vec3 | None = None             # bounding box of the visuals (m)
+    collision: bool = True
+    trajectory: str | None = None              # "circle r=8 @2 m/s", "line ...", None
+    control: str | None = None                 # agents: "external" | "waypoint" | "idle"
+    sensors: list[str] = Field(default_factory=list)
+    sensor_mounts: list[dict[str, Any]] = Field(default_factory=list)
+    physical: dict[str, Any] = Field(default_factory=dict)   # mass, limits, drone_type ...
+    state: EntityState | None = None
+
+
 class EntityState(BaseModel):
     """Privileged simulator state (world frame unless noted)."""
     entity_id: str
@@ -342,7 +361,10 @@ class SpawnRequest(BaseModel):
     pose: Pose = Field(default_factory=Pose)
     params: dict[str, Any] = Field(default_factory=dict)
     observation: str | None = None               # profile name for agents
-    camera: dict[str, Any] | None = None         # CameraSpec fields; needs a world with rendering enabled
+    camera: dict[str, Any] | None = None         # legacy CameraSpec fields; prefer `sensors`
+    drone_type: str = "standard"                 # standard | light | heavy
+    sensors: list[dict[str, Any]] | None = None  # SensorMount dicts (name, type, pose, params)
+    trajectory: dict[str, Any] | None = None     # TrajectorySpec for non-agent entities (circle/line/waypoints/rotate)
 
 
 class Metrics(BaseModel):

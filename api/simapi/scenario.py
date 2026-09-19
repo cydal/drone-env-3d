@@ -19,21 +19,46 @@ class CameraSpec(BaseModel):
     depth: bool = True                # also emit a depth camera with the same intrinsics
 
 
+class SensorMount(BaseModel):
+    """A sensor attached to an entity at a configurable pose (x y z roll pitch yaw, body frame)."""
+    name: str
+    type: Literal["camera", "depth", "imu", "gps", "contact"]
+    pose: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    params: dict[str, Any] = Field(default_factory=dict)   # camera/depth: width, height, hfov, update_rate, far
+
+
 class AgentSpec(BaseModel):
     id: str
     type: EntityKind = "drone"
     template: str = "quadcopter"
+    drone_type: str = "standard"      # see engine/gazebo/sdf.py DRONE_TYPES: standard | light | heavy
     spawn: Pose = Field(default_factory=Pose)
     observation: str = "state"        # profile name (built-in or scenario-defined)
     control: Literal["velocity", "waypoint"] = "velocity"   # highest action level accepted
-    limits: ActionLimits = Field(default_factory=ActionLimits)
-    camera: CameraSpec | None = None  # present -> rendering sensors are attached
+    limits: ActionLimits | None = None   # None -> the drone type's defaults
+    camera: CameraSpec | None = None  # legacy single forward camera (+depth); prefer `sensors`
+    sensors: list[SensorMount] = Field(default_factory=list)   # configurable sensor mounts
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def camera_mounts(self) -> list[SensorMount]:
+        """All image-producing mounts, including the legacy `camera:` block."""
+        out = [m for m in self.sensors if m.type in ("camera", "depth")]
+        if self.camera is not None and not out:
+            cp = dict(width=self.camera.width, height=self.camera.height, hfov=self.camera.hfov, update_rate=self.camera.update_rate)
+            out.append(SensorMount(name="camera", type="camera", pose=list(self.camera.pose), params=cp))
+            if self.camera.depth:
+                out.append(SensorMount(name="depth", type="depth", pose=list(self.camera.pose), params=cp))
+        return out
+
+    @property
+    def has_rendering(self) -> bool:
+        return bool(self.camera_mounts)
 
 
 class TrajectorySpec(BaseModel):
     """Deterministic, environment-owned motion for non-agent entities."""
-    type: Literal["circle", "line", "waypoints", "static"] = "static"
+    type: Literal["circle", "line", "waypoints", "rotate", "static"] = "static"
     center: Vec3 = Field(default_factory=Vec3)
     radius: float = 10.0
     speed: float = 2.0                # m/s along the path
@@ -42,6 +67,7 @@ class TrajectorySpec(BaseModel):
     waypoints: list[Vec3] = Field(default_factory=list)
     loop: bool = True                 # line: ping-pong / waypoints: cycle
     phase: float = 0.0                # seconds offset
+    yaw_rate: float = 0.5             # rotate: rad/s about z at the spawn pose
 
 
 class EntitySpec(BaseModel):
@@ -98,7 +124,7 @@ class Scenario(BaseModel):
 
     @property
     def rendering(self) -> bool:
-        return any(a.camera is not None for a in self.agents)
+        return any(a.has_rendering for a in self.agents)
 
     @classmethod
     def load(cls, path: Path) -> "Scenario":

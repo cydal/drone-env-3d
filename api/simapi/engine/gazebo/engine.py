@@ -73,9 +73,10 @@ class _RateMeter:
 
 
 class _AgentIO:
-    def __init__(self, agent_id: str, camera: CameraSpec | None) -> None:
+    def __init__(self, agent_id: str, camera: CameraSpec | None, mounts=None) -> None:
         self.id = agent_id
         self.camera = camera
+        self.mounts = list(mounts or [])          # image-producing SensorMounts
         self.odom = None
         self.odom_time = 0.0
         self.prev_vel: Vec3 | None = None
@@ -164,7 +165,7 @@ class GazeboEngine(SimulationEngine):
             self._kinds.update({e.id: e.type for e in scenario.entities})
         await self._refresh_scene()
         for a in scenario.agents:
-            self._attach_agent(a.id, a.camera)
+            self._attach_agent(a.id, a.camera, a.camera_mounts)
         log.info("world '%s' ready (seed=%s, rendering=%s), agents=%s",
                  self.world, self._seed, self.rendering, list(self._agents))
 
@@ -478,9 +479,9 @@ class GazeboEngine(SimulationEngine):
                 raise TimeoutError(f"entity {entity_id!r} did not {'appear' if present else 'disappear'} in time")
             await asyncio.sleep(0.1)
 
-    def _attach_agent(self, agent_id: str, camera: CameraSpec | None) -> None:
+    def _attach_agent(self, agent_id: str, camera: CameraSpec | None, mounts=None) -> None:
         g = self.tp.g
-        io = _AgentIO(agent_id, camera)
+        io = _AgentIO(agent_id, camera, mounts)
         with self._lock:
             self._agents[agent_id] = io
             self._kinds.setdefault(agent_id, "drone")
@@ -489,21 +490,21 @@ class GazeboEngine(SimulationEngine):
         self.tp.subscribe(g["IMU"], f"/{agent_id}/imu", self._make_store_cb(io, "imu"))
         self.tp.subscribe(g["NavSat"], f"/{agent_id}/navsat", self._make_store_cb(io, "navsat"))
         self.tp.subscribe(g["Contacts"], f"/{agent_id}/contacts", self._make_contact_cb(io))
-        if camera is not None and self.rendering:
-            self.tp.subscribe(g["Image"], f"/{agent_id}/camera", self._make_frame_cb(io, "camera"))
-            if camera.depth:
-                self.tp.subscribe(g["Image"], f"/{agent_id}/depth", self._make_frame_cb(io, "depth"))
+        if self.rendering:
+            for m in io.mounts:
+                self.tp.subscribe(g["Image"], f"/{agent_id}/{m.name}", self._make_frame_cb(io, m.name))
         # Advertise command topics now: gz-transport drops messages published before
         # discovery connects publisher and subscriber.
         self.tp.publisher(f"/{agent_id}/cmd/twist", g["Twist"])
         self.tp.publisher(f"/{agent_id}/cmd/enable", g["Boolean"])
 
     def _detach_agent(self, agent_id: str) -> None:
-        for t in (f"/model/{agent_id}/odometry", f"/{agent_id}/imu", f"/{agent_id}/navsat",
-                  f"/{agent_id}/contacts", f"/{agent_id}/camera", f"/{agent_id}/depth"):
-            self.tp.unsubscribe(t)
         with self._lock:
-            self._agents.pop(agent_id, None)
+            io = self._agents.pop(agent_id, None)
+        topics = [f"/model/{agent_id}/odometry", f"/{agent_id}/imu", f"/{agent_id}/navsat", f"/{agent_id}/contacts"]
+        topics += [f"/{agent_id}/{m.name}" for m in (io.mounts if io else [])]
+        for t in topics:
+            self.tp.unsubscribe(t)
 
     def _kind(self, name: str) -> str:
         k = self._kinds.get(name)
@@ -597,11 +598,14 @@ class GazeboEngine(SimulationEngine):
         with self._lock:
             io = self._agents.get(agent_id)
             names = ["imu", "navsat", "contact"]
-            if io and io.camera and self.rendering:
-                names.append("camera")
-                if io.camera.depth:
-                    names.append("depth")
+            if io and self.rendering:
+                names += [m.name for m in io.mounts]
             return names
+
+    def sensor_mounts(self, agent_id: str) -> list:
+        with self._lock:
+            io = self._agents.get(agent_id)
+            return list(io.mounts) if io else []
 
     def frame(self, agent_id: str, sensor: str) -> RawFrame | None:
         with self._lock:
@@ -620,17 +624,19 @@ class GazeboEngine(SimulationEngine):
         q = pose.orientation
         msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = q.x, q.y, q.z, q.w
 
-    async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict, *, camera=None) -> bool:
+    async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict, *, camera=None,
+                    drone_type: str = "standard", mounts=None) -> bool:
         g = self.tp.g
         tpl = sdfgen.TEMPLATES.get(template)
         if tpl is None:
             raise ValueError(f"unknown template {template!r}; known: {list(sdfgen.TEMPLATES)}")
         is_agent = template in sdfgen.AGENT_TEMPLATES
-        if is_agent and camera is not None and not self.rendering:
+        mounts = list(mounts or [])
+        if is_agent and (camera is not None or mounts) and not self.rendering:
             log.warning("spawn %s: cameras requested but the world has no Sensors system; ignoring", entity_id)
-            camera = None
+            camera, mounts = None, [m for m in mounts if m.type not in ("camera", "depth")]
         req = g["EntityFactory"]()
-        req.sdf = tpl(entity_id, params, camera=camera) if is_agent else tpl(entity_id, params)
+        req.sdf = tpl(entity_id, params, camera=camera, drone_type=drone_type, mounts=mounts) if is_agent else tpl(entity_id, params)
         req.name = entity_id
         req.allow_renaming = False
         self._fill_pose(req.pose, pose)
@@ -638,9 +644,14 @@ class GazeboEngine(SimulationEngine):
         await loop.run_in_executor(None, lambda: self._request_retry(f"/world/{self.world}/create", req, g["Boolean"]))
         await self._wait_for_model(entity_id, present=True)
         with self._lock:
-            self._kinds[entity_id] = "drone" if is_agent else ("vehicle" if template == "vehicle" else "target")
+            self._kinds[entity_id] = "drone" if is_agent else {"vehicle": "vehicle", "platform": "dynamic", "beacon": "dynamic",
+                                                              "obstacle": "obstacle"}.get(template, "target")
         if is_agent and entity_id in self._model_ids.values():
-            self._attach_agent(entity_id, camera)
+            img_mounts = [m for m in mounts if m.type in ("camera", "depth")]
+            if camera is not None and not img_mounts:
+                from ...scenario import AgentSpec
+                img_mounts = AgentSpec(id=entity_id, camera=camera).camera_mounts
+            self._attach_agent(entity_id, camera, img_mounts)
         return is_agent
 
     async def remove(self, entity_id: str) -> None:

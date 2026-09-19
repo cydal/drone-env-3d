@@ -28,11 +28,11 @@ def _material(rgba: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Quadcopter agent template
+# Quadcopter agent template + drone types
 # ---------------------------------------------------------------------------
 
+# Rotor layout of the X3 (scaled per type by `arm_scale`). name, (x, y, z), turning dir, ctrl sign
 _ROTORS = [
-    # name, (x, y, z), turning direction, controller direction sign
     ("rotor_0", (0.13, -0.22, 0.023), "ccw", 1),
     ("rotor_1", (-0.13, 0.20, 0.023), "ccw", 1),
     ("rotor_2", (0.13, 0.22, 0.023), "cw", -1),
@@ -41,31 +41,58 @@ _ROTORS = [
 MOTOR_CONSTANT = 8.54858e-06
 MOMENT_CONSTANT = 0.016
 
+# Hover check: 4 * motor_constant * w^2 = mass * g  ->  w must stay below max_rot_velocity.
+#   standard: w = sqrt(1.5*9.8/4/8.55e-6) = 656 rad/s   light: sqrt(0.9*9.8/4/5.5e-6) = 633
+#   heavy:    sqrt(2.6*9.8/4/1.65e-5) = 621             (all < 800)
+DRONE_TYPES: dict[str, dict] = {
+    "standard": dict(label="Quadrotor (standard)", mass=1.5, inertia=(0.0347563, 0.07, 0.0977), arm_scale=1.0,
+                     body=(0.18, 0.12, 0.06), rotor_radius=0.10, motor_constant=8.54858e-06, moment_constant=0.016,
+                     max_rot_velocity=800.0, velocity_gain=(2.7, 2.7, 2.7), attitude_gain=(2, 3, 0.15),
+                     angular_rate_gain=(0.4, 0.52, 0.18), max_linear_acceleration=(2, 2, 2),
+                     limits=dict(max_speed_xy=6.0, max_speed_z=3.0, max_yaw_rate=1.5), color="0.95 0.45 0.10 1"),
+    "light":    dict(label="Quadrotor (light, agile)", mass=0.9, inertia=(0.0150, 0.030, 0.042), arm_scale=0.8,
+                     body=(0.14, 0.10, 0.05), rotor_radius=0.08, motor_constant=5.5e-06, moment_constant=0.014,
+                     max_rot_velocity=900.0, velocity_gain=(3.2, 3.2, 3.2), attitude_gain=(2.2, 3.0, 0.15),
+                     angular_rate_gain=(0.35, 0.45, 0.15), max_linear_acceleration=(3, 3, 3),
+                     limits=dict(max_speed_xy=8.0, max_speed_z=4.0, max_yaw_rate=2.0), color="0.20 0.85 0.95 1"),
+    "heavy":    dict(label="Quadrotor (heavy, payload)", mass=2.6, inertia=(0.080, 0.16, 0.22), arm_scale=1.3,
+                     body=(0.26, 0.18, 0.09), rotor_radius=0.13, motor_constant=1.65e-05, moment_constant=0.02,
+                     max_rot_velocity=800.0, velocity_gain=(2.2, 2.2, 2.2), attitude_gain=(2, 3, 0.15),
+                     angular_rate_gain=(0.5, 0.65, 0.22), max_linear_acceleration=(1.5, 1.5, 1.5),
+                     limits=dict(max_speed_xy=4.0, max_speed_z=2.0, max_yaw_rate=1.0), color="0.75 0.35 0.85 1"),
+}
 
-def _camera_sensors(ns: str, cam: CameraSpec) -> str:
-    pose = " ".join(str(v) for v in cam.pose)
-    out = f"""
-      <sensor name="camera" type="camera">
+
+def _mount_sensors(ns: str, mounts) -> str:
+    """SDF for a list of SensorMount (camera / depth / imu / gps / contact). Base sensors that
+    the platform relies on (imu, gps, contact) are always present with their default names."""
+    out = ""
+    for m in mounts:
+        pose = " ".join(str(v) for v in m.pose)
+        p = m.params
+        if m.type == "camera":
+            out += f"""
+      <sensor name="{m.name}" type="camera">
         <pose>{pose}</pose>
-        <topic>/{ns}/camera</topic>
-        <update_rate>{cam.update_rate}</update_rate>
+        <topic>/{ns}/{m.name}</topic>
+        <update_rate>{p.get('update_rate', 15)}</update_rate>
         <camera>
-          <horizontal_fov>{cam.hfov}</horizontal_fov>
-          <image><width>{cam.width}</width><height>{cam.height}</height><format>RGB_INT8</format></image>
-          <clip><near>0.05</near><far>300</far></clip>
+          <horizontal_fov>{p.get('hfov', 1.396)}</horizontal_fov>
+          <image><width>{p.get('width', 320)}</width><height>{p.get('height', 240)}</height><format>RGB_INT8</format></image>
+          <clip><near>0.05</near><far>{p.get('far', 300)}</far></clip>
         </camera>
         <always_on>1</always_on>
       </sensor>"""
-    if cam.depth:
-        out += f"""
-      <sensor name="depth" type="depth_camera">
+        elif m.type == "depth":
+            out += f"""
+      <sensor name="{m.name}" type="depth_camera">
         <pose>{pose}</pose>
-        <topic>/{ns}/depth</topic>
-        <update_rate>{cam.update_rate}</update_rate>
+        <topic>/{ns}/{m.name}</topic>
+        <update_rate>{p.get('update_rate', 15)}</update_rate>
         <camera>
-          <horizontal_fov>{cam.hfov}</horizontal_fov>
-          <image><width>{cam.width}</width><height>{cam.height}</height><format>R_FLOAT32</format></image>
-          <clip><near>0.1</near><far>100</far></clip>
+          <horizontal_fov>{p.get('hfov', 1.396)}</horizontal_fov>
+          <image><width>{p.get('width', 320)}</width><height>{p.get('height', 240)}</height><format>R_FLOAT32</format></image>
+          <clip><near>0.1</near><far>{p.get('far', 100)}</far></clip>
         </camera>
         <always_on>1</always_on>
       </sensor>"""
@@ -73,27 +100,39 @@ def _camera_sensors(ns: str, cam: CameraSpec) -> str:
 
 
 def quadcopter_sdf(entity_id: str, params: dict | None = None, *, camera: CameraSpec | None = None,
-                   wrap_in_sdf: bool = True) -> str:
-    """Return the <model> (optionally wrapped in <sdf>) for a quadcopter agent."""
+                   drone_type: str = "standard", mounts=None, wrap_in_sdf: bool = True) -> str:
+    """Return the <model> (optionally wrapped in <sdf>) for a quadcopter agent of a given type."""
     params = params or {}
     ns = entity_id
-    color = params.get("color", "0.95 0.45 0.10 1")
+    T = DRONE_TYPES[drone_type]
+    color = params.get("color", T["color"])
+    mounts = list(mounts or [])
+    if camera is not None and not any(m.type in ("camera", "depth") for m in mounts):   # legacy camera: block
+        from ...scenario import SensorMount
+        cp = dict(width=camera.width, height=camera.height, hfov=camera.hfov, update_rate=camera.update_rate)
+        mounts.append(SensorMount(name="camera", type="camera", pose=list(camera.pose), params=cp))
+        if camera.depth:
+            mounts.append(SensorMount(name="depth", type="depth", pose=list(camera.pose), params=cp))
+    k = T["arm_scale"]
+    rr = T["rotor_radius"]
+    MOTOR_CONSTANT, MOMENT_CONSTANT = T["motor_constant"], T["moment_constant"]
 
     rotors_links, rotors_joints, motor_plugins, rotor_cfg = [], [], [], []
-    for name, (x, y, z), turning, direction in _ROTORS:
+    for name, (x0, y0, z0), turning, direction in _ROTORS:
+        x, y, z = x0 * k, y0 * k, z0
         rotors_links.append(f"""
     <link name="{name}">
-      <pose>{x} {y} {z} 0 0 0</pose>
+      <pose>{x:.4f} {y:.4f} {z} 0 0 0</pose>
       <inertial>
         <mass>0.005</mass>
         <inertia><ixx>9.75e-07</ixx><iyy>4.17041e-05</iyy><izz>4.26041e-05</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
       <collision name="{name}_collision">
-        <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+        <geometry><cylinder><length>0.005</length><radius>{rr}</radius></cylinder></geometry>
         <surface><contact><ode/></contact><friction><ode/></friction></surface>
       </collision>
       <visual name="{name}_visual">
-        <geometry><cylinder><length>0.006</length><radius>0.1</radius></cylinder></geometry>
+        <geometry><cylinder><length>0.006</length><radius>{rr}</radius></cylinder></geometry>
         {_material("0.15 0.15 0.15 0.85")}
       </visual>
     </link>""")
@@ -115,7 +154,7 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, camera: Camera
       <turningDirection>{turning}</turningDirection>
       <timeConstantUp>0.0125</timeConstantUp>
       <timeConstantDown>0.025</timeConstantDown>
-      <maxRotVelocity>800.0</maxRotVelocity>
+      <maxRotVelocity>{T["max_rot_velocity"]}</maxRotVelocity>
       <motorConstant>{MOTOR_CONSTANT}</motorConstant>
       <momentConstant>{MOMENT_CONSTANT}</momentConstant>
       <commandSubTopic>cmd/motor_speed</commandSubTopic>
@@ -138,30 +177,33 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, camera: Camera
         arms += f"""
       <visual name="arm_{i}">
         <pose>0 0 0.01 0 0 {yaw}</pose>
-        <geometry><box><size>0.52 0.03 0.015</size></box></geometry>
+        <geometry><box><size>{0.52 * k:.3f} 0.03 0.015</size></box></geometry>
         {_material("0.25 0.25 0.28 1")}
       </visual>"""
 
-    cameras = _camera_sensors(ns, camera) if camera else ""
+    cameras = _mount_sensors(ns, mounts)
+    bx, by, bz = T["body"]
+    ixx, iyy, izz = T["inertia"]
+    vg, ag, rg, mla = T["velocity_gain"], T["attitude_gain"], T["angular_rate_gain"], T["max_linear_acceleration"]
 
     model = f"""
   <model name="{escape(entity_id)}">
     <link name="base_link">
       <inertial>
-        <mass>1.5</mass>
-        <inertia><ixx>0.0347563</ixx><iyy>0.07</iyy><izz>0.0977</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+        <mass>{T["mass"]}</mass>
+        <inertia><ixx>{ixx}</ixx><iyy>{iyy}</iyy><izz>{izz}</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
       <collision name="base_collision">
         <pose>0 0 0.01 0 0 0</pose>
-        <geometry><box><size>0.47 0.47 0.11</size></box></geometry>
+        <geometry><box><size>{0.47 * k:.3f} {0.47 * k:.3f} 0.11</size></box></geometry>
       </collision>
       <visual name="body">
-        <geometry><box><size>0.18 0.12 0.06</size></box></geometry>
+        <geometry><box><size>{bx} {by} {bz}</size></box></geometry>
         {_material(color)}
       </visual>
       <visual name="nose">
-        <pose>0.11 0 0 0 0 0</pose>
-        <geometry><box><size>0.05 0.06 0.03</size></box></geometry>
+        <pose>{bx / 2 + 0.02:.3f} 0 0 0 0 0</pose>
+        <geometry><box><size>0.05 {by / 2:.3f} 0.03</size></box></geometry>
         {_material("0.1 0.1 0.1 1")}
       </visual>{arms}
       <sensor name="imu" type="imu">
@@ -191,10 +233,10 @@ def quadcopter_sdf(entity_id: str, params: dict | None = None, *, camera: Camera
       <commandSubTopic>cmd/twist</commandSubTopic>
       <enableSubTopic>cmd/enable</enableSubTopic>
       <comLinkName>base_link</comLinkName>
-      <velocityGain>2.7 2.7 2.7</velocityGain>
-      <attitudeGain>2 3 0.15</attitudeGain>
-      <angularRateGain>0.4 0.52 0.18</angularRateGain>
-      <maximumLinearAcceleration>2 2 2</maximumLinearAcceleration>
+      <velocityGain>{vg[0]} {vg[1]} {vg[2]}</velocityGain>
+      <attitudeGain>{ag[0]} {ag[1]} {ag[2]}</attitudeGain>
+      <angularRateGain>{rg[0]} {rg[1]} {rg[2]}</angularRateGain>
+      <maximumLinearAcceleration>{mla[0]} {mla[1]} {mla[2]}</maximumLinearAcceleration>
       <rotorConfiguration>{''.join(rotor_cfg)}
       </rotorConfiguration>
     </plugin>
@@ -265,8 +307,64 @@ def vehicle_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool
     return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
 
 
+def platform_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool = True, **_) -> str:
+    """A flat moving platform (e.g. a landing deck on rails). Gravity off; kinematic."""
+    params = params or {}
+    L, W, H = (float(params.get("length", 4.0)), float(params.get("width", 4.0)), float(params.get("height", 0.3)))
+    color = params.get("color", "0.85 0.85 0.88 1")
+    model = f"""
+  <model name="{escape(entity_id)}">
+    <link name="link">
+      <gravity>false</gravity>
+      <inertial><mass>500</mass><inertia><ixx>700</ixx><iyy>700</iyy><izz>1300</izz></inertia></inertial>
+      <collision name="collision"><geometry><box><size>{L} {W} {H}</size></box></geometry></collision>
+      <visual name="deck"><geometry><box><size>{L} {W} {H}</size></box></geometry>{_material(color)}</visual>
+      <visual name="marking">
+        <pose>0 0 {H / 2 + 0.005} 0 0 0</pose>
+        <geometry><cylinder><radius>{min(L, W) * 0.3}</radius><length>0.01</length></cylinder></geometry>
+        {_material("0.95 0.55 0.10 1")}
+      </visual>
+    </link>
+  </model>"""
+    return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
+
+
+def beacon_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool = True, **_) -> str:
+    """A rotating object (radar/beacon head on a mast). Kinematic yaw via trajectory type 'rotate'."""
+    params = params or {}
+    color = params.get("color", "0.9 0.9 0.2 1")
+    model = f"""
+  <model name="{escape(entity_id)}">
+    <link name="link">
+      <gravity>false</gravity>
+      <inertial><mass>20</mass><inertia><ixx>2</ixx><iyy>2</iyy><izz>2</izz></inertia></inertial>
+      <collision name="collision"><geometry><box><size>1.6 0.3 0.3</size></box></geometry></collision>
+      <visual name="bar"><geometry><box><size>1.6 0.3 0.3</size></box></geometry>{_material(color)}</visual>
+      <visual name="hub"><geometry><cylinder><radius>0.25</radius><length>0.4</length></cylinder></geometry>{_material("0.2 0.2 0.22 1")}</visual>
+    </link>
+  </model>"""
+    return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
+
+
+def obstacle_sdf(entity_id: str, params: dict | None = None, *, wrap_in_sdf: bool = True, **_) -> str:
+    """A static box obstacle (barrier, crate, wall segment) spawnable at runtime."""
+    params = params or {}
+    sx, sy, sz = (float(params.get("sx", 1.0)), float(params.get("sy", 1.0)), float(params.get("sz", 1.0)))
+    color = params.get("color", "0.6 0.6 0.62 1")
+    model = f"""
+  <model name="{escape(entity_id)}">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry></collision>
+      <visual name="visual"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry>{_material(color)}</visual>
+    </link>
+  </model>"""
+    return f'<?xml version="1.0"?>\n<sdf version="1.9">{model}\n</sdf>\n' if wrap_in_sdf else model
+
+
 AGENT_TEMPLATES = {"quadcopter": quadcopter_sdf}
-ENTITY_TEMPLATES = {"target": target_sdf, "vehicle": vehicle_sdf}
+ENTITY_TEMPLATES = {"target": target_sdf, "vehicle": vehicle_sdf, "platform": platform_sdf, "beacon": beacon_sdf,
+                    "obstacle": obstacle_sdf}
 TEMPLATES = {**AGENT_TEMPLATES, **ENTITY_TEMPLATES}
 
 
@@ -314,7 +412,8 @@ def build_world_sdf(base_world_sdf: str, scenario: Scenario) -> str:
     models = []
     for a in scenario.agents:
         tpl = AGENT_TEMPLATES[a.template]
-        models.append(_with_pose(tpl(a.id, a.params, camera=a.camera, wrap_in_sdf=False), a.spawn))
+        models.append(_with_pose(tpl(a.id, a.params, camera=a.camera, drone_type=a.drone_type, mounts=a.sensors,
+                                     wrap_in_sdf=False), a.spawn))
     for e in scenario.entities:
         tpl = ENTITY_TEMPLATES[e.template]
         models.append(_with_pose(tpl(e.id, e.params, wrap_in_sdf=False), e.spawn))

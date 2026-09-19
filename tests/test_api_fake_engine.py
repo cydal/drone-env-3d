@@ -53,7 +53,7 @@ class FakeEngine(SimulationEngine):
         if eid in self.agents: return EntityState(entity_id=eid, sim_time=self.t, pose=self.agents[eid])
         if eid in self.entities: return EntityState(entity_id=eid, sim_time=self.t, pose=self.entities[eid])
         return None
-    async def spawn(self, eid, template, pose, params, *, camera=None):
+    async def spawn(self, eid, template, pose, params, *, camera=None, drone_type="standard", mounts=None):
         if template == "quadcopter": self.agents[eid] = pose; return True
         self.entities[eid] = pose; return False
     async def remove(self, eid): self.agents.pop(eid, None); self.entities.pop(eid, None)

@@ -223,12 +223,23 @@ class Simulation:
         return self._get(f"/entities/{entity_id}")
 
     def spawn(self, entity_id: str, *, template: str = "quadcopter", position=(0.0, 0.0, 0.0),
-              observation: str | None = None, camera: dict[str, Any] | None = None, **params) -> None:
-        """Spawn an entity. `camera={...}` attaches RGB(+depth) sensors (world must have rendering)."""
+              observation: str | None = None, camera: dict[str, Any] | None = None, drone_type: str = "standard",
+              sensors: list[dict[str, Any]] | None = None, trajectory: dict[str, Any] | None = None, **params) -> None:
+        """Spawn an entity.
+        Agents: template 'quadcopter', drone_type standard|light|heavy, sensors=[{name,type,pose,params}].
+        Entities: template target|vehicle|platform|beacon|obstacle, trajectory={type: circle|line|waypoints|rotate, ...}."""
         x, y, z = position
         self._post("/entities", {"entity_id": entity_id, "template": template,
                                  "pose": {"position": {"x": x, "y": y, "z": z}}, "params": params,
-                                 "observation": observation, "camera": camera})
+                                 "observation": observation, "camera": camera, "drone_type": drone_type,
+                                 "sensors": sensors, "trajectory": trajectory})
+
+    def entity_detail(self, entity_id: str) -> dict[str, Any]:
+        """Inspector view: category, type label, dimensions, sensors/mounts, trajectory, physical params, state."""
+        return self._get(f"/entities/{entity_id}/detail")
+
+    def templates(self) -> dict[str, Any]:
+        return self._get("/templates")
 
     def set_pose(self, entity_id: str, position, yaw: float = 0.0) -> None:
         """Teleport an entity (world frame). Applied on the next physics iteration."""

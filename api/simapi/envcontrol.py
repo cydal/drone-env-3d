@@ -28,6 +28,9 @@ def pose_at(spec: TrajectorySpec, t: float, spawn: Pose) -> Pose:
     if spec.type == "static":
         return spawn
 
+    if spec.type == "rotate":
+        return Pose(position=spawn.position, orientation=_yaw_quat(spec.yaw_rate * t))
+
     if spec.type == "circle":
         r = max(spec.radius, 1e-3)
         omega = spec.speed / r

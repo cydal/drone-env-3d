@@ -67,7 +67,7 @@ class SimulationEngine(ABC):
 
     @abstractmethod
     async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict,
-                    *, camera=None) -> bool:
+                    *, camera=None, drone_type: str = "standard", mounts=None) -> bool:
         """Returns True if the new entity is an agent."""
 
     @abstractmethod
@@ -96,6 +96,9 @@ class SimulationEngine(ABC):
 
     @abstractmethod
     def sensor_names(self, agent_id: str) -> list[str]: ...
+
+    def sensor_mounts(self, agent_id: str) -> list:
+        return []
 
     @abstractmethod
     def frame(self, agent_id: str, sensor: str) -> RawFrame | None: ...

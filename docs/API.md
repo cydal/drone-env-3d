@@ -95,9 +95,10 @@ Batch: `POST /actions {"drone_01": {"action": ...}, ...}` → `{"ok", "rejected"
   transport layer and applies for the whole step.
 * `POST /simulation/step {"steps": N, "actions": {...}}`
   1. validates and applies the actions (rejections are reported, the step still runs),
-  2. places environment-driven entities for the target time,
-  3. runs waypoint controllers,
-  4. advances **exactly N** iterations and blocks until Gazebo is paused again,
+  2. advances **exactly N** iterations in deterministic 25-iteration chunks whenever the
+     environment has something to re-evaluate (kinematic entities are placed for each
+     chunk's end time; waypoint controllers are re-run each chunk so they close the loop),
+     otherwise in one go; blocks until Gazebo is paused again,
   5. checks bounds/timeout, collects events since the previous step response,
   6. returns `{episode, status, observations, events, rejected_actions}`.
 * Sensors update inside the step at their own rates (IMU 200 Hz, NavSat 10 Hz,

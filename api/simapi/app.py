@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 
 from .hub import TelemetryHub
-from .models import (ActionEnvelope, AgentInfo, Episode, Event, Metrics, ModeRequest, Observation, Pose,
+from .models import (ActionEnvelope, AgentInfo, EntityDetail, Episode, Event, Metrics, ModeRequest, Observation, Pose,
                      ResetRequest, SimStatus, SpawnRequest, StepRequest, StepResponse)
 from .scenario import Scenario
 from .sensors import FrameEncoder
@@ -163,13 +163,28 @@ def create_app(engine_factory=None) -> FastAPI:
             raise HTTPException(404, "entity not found")
         return st
 
+    @app.get("/entities/{entity_id}/detail", response_model=EntityDetail)
+    async def entity_detail(entity_id: str):
+        d = await service.entity_detail(entity_id)
+        if d is None:
+            raise HTTPException(404, "entity not found")
+        return d
+
+    @app.get("/templates")
+    def templates():
+        from .engine.gazebo.sdf import AGENT_TEMPLATES, DRONE_TYPES, ENTITY_TEMPLATES
+        return {"agents": list(AGENT_TEMPLATES), "entities": list(ENTITY_TEMPLATES),
+                "drone_types": {k: {kk: v[kk] for kk in ("label", "mass", "limits")} for k, v in DRONE_TYPES.items()}}
+
     @app.post("/entities")
     async def spawn(req: SpawnRequest):
         _require_running(service)
         try:
-            from .scenario import CameraSpec
+            from .scenario import CameraSpec, SensorMount
             cam = CameraSpec.model_validate(req.camera) if req.camera is not None else None
-            await service.spawn(req.entity_id, req.template, req.pose, req.params, observation=req.observation, camera=cam)
+            mounts = [SensorMount.model_validate(m) for m in (req.sensors or [])]
+            await service.spawn(req.entity_id, req.template, req.pose, req.params, observation=req.observation, camera=cam,
+                                drone_type=req.drone_type, sensors=mounts, trajectory=req.trajectory)
         except Exception as e:
             raise _err(e)
         return {"spawned": req.entity_id}

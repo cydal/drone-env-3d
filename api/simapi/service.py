@@ -17,14 +17,14 @@ from . import config
 from .engine.base import EngineEvent, SimulationEngine
 from .envcontrol import TrajectoryController
 from .hub import TelemetryHub
-from .models import (Action, ActionLimits, ActionSpace, AgentInfo, ArmAction, BodyVelocity, EntityInfo,
+from .models import (Action, ActionLimits, ActionSpace, AgentInfo, ArmAction, BodyVelocity, EntityDetail, EntityInfo,
                      EntityState, Episode, Event, HoldAction, Metrics, NearbyAgent, Observation,
                      ObservationSpace, Pose, SceneDesc, SensorFrameRef, SimMode, SimStatus, StepResponse,
                      VelocityAction, WaypointAction)
 from .observation import NEARBY_RADIUS_M, resolve_profile
 from .recording import EpisodeLogger
 from .recorder import Recorder, Snapshot, SnapshotStore
-from .scenario import AgentSpec, CameraSpec, Scenario, list_scenarios
+from .scenario import AgentSpec, CameraSpec, Scenario, SensorMount, list_scenarios
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +44,9 @@ class ActionError(ValueError):
 
 class AgentRuntime:
     def __init__(self, spec: AgentSpec, components: list[str]) -> None:
+        if spec.limits is None:
+            from .engine.gazebo.sdf import DRONE_TYPES
+            spec = spec.model_copy(update={"limits": ActionLimits(**DRONE_TYPES.get(spec.drone_type, DRONE_TYPES["standard"])["limits"])})
         self.spec = spec
         self.components = components
         self.last_action: Action | None = None
@@ -62,6 +65,7 @@ class SimulationService:
         self.mode: SimMode = "realtime"
         self.agents: dict[str, AgentRuntime] = {}
         self._runtime_spawned: set[str] = set()   # not part of the scenario's initial state
+        self._runtime_entities: dict[str, Any] = {}  # runtime-spawned non-agent entities with trajectories
         self.overlay: dict | None = None            # last annotation pushed by an external tool
         self.recorder: Recorder | None = None       # per-episode action log (+ optional rows)
         self.snapshots = SnapshotStore(config.RUNS_DIR / "snapshots")
@@ -116,7 +120,7 @@ class SimulationService:
         self._runtime_spawned.clear()
         await asyncio.sleep(SETTLE_S)      # let controller systems discover our command publishers
         for rt in self.agents.values():
-            if ("camera" in rt.components or "depth" in rt.components) and rt.spec.camera is None:
+            if ("camera" in rt.components or "depth" in rt.components) and not rt.spec.has_rendering:
                 log.warning("agent %s: profile needs camera frames but no camera is configured", rt.spec.id)
         self._trajectories = TrajectoryController(scenario.entities)
         self._open_episode()
@@ -159,6 +163,9 @@ class SimulationService:
             # (segfault in dartsim GetContactsFromLastStep). Save the scenario to keep them.
             for eid in sorted(self._runtime_spawned):
                 self.agents.pop(eid, None)
+                if eid in self._runtime_entities:
+                    self._trajectories.entities = [e for e in self._trajectories.entities if e.id != eid]
+                    self._runtime_entities.pop(eid)
                 try:
                     await self.engine.remove(eid)
                 except Exception as e:
@@ -269,15 +276,16 @@ class SimulationService:
         seq_before = self._last_step_seq   # events since the previous step response
         dt = self.scenario.simulation.step_size
         t_now = self.engine.status().sim_time
-        # Environment-driven entities are placed kinematically; chunk long steps so they
-        # move continuously (every SUBSTEP iterations) instead of teleporting once.
-        chunk = SUBSTEP_ITERS if self._trajectories.entities else steps
+        # Long steps are chunked (SUBSTEP_ITERS = 0.1 s) whenever something inside the environment
+        # needs re-evaluating during the step: kinematic entities move continuously instead of
+        # teleporting once, and waypoint controllers close the loop instead of flying open-loop
+        # for the whole step. Chunking is deterministic, so replay/snapshots are unaffected.
+        chunk = SUBSTEP_ITERS if self._needs_substeps() else steps
         done = 0
         while done < steps:
             n = min(chunk, steps - done)
             self._place_entities(t_now + (done + n) * dt)   # applied on the first iteration of this chunk
-            if done == 0:
-                self._run_waypoint_controllers()
+            self._run_waypoint_controllers()
             await self.engine.step(n)
             done += n
         if self.episode:
@@ -337,15 +345,65 @@ class SimulationService:
     def entity_state(self, entity_id: str) -> EntityState | None:
         return self.engine.entity_state(entity_id)
 
+    async def entity_detail(self, entity_id: str) -> EntityDetail | None:
+        infos = {e.entity_id: e for e in self.engine.list_entities()}
+        info = infos.get(entity_id)
+        if info is None:
+            return None
+        scene = await self.engine.scene()
+        model = next((m for m in scene.models if m.entity_id == entity_id), None)
+        dims = _bbox(model) if model else None
+        rt = self.agents.get(entity_id)
+        ent = next((e for e in (self.scenario.entities if self.scenario else []) if e.id == entity_id), None) \
+            or self._runtime_entities.get(entity_id)
+        category = _category(info.kind, entity_id, model.is_static if model else False)
+        detail = EntityDetail(entity_id=entity_id, kind=info.kind, category=category, is_agent=info.is_agent,
+                              is_static=model.is_static if model else False, dimensions=dims,
+                              collision=bool(model and any(l.collisions or l.visuals for l in model.links)),
+                              state=self.engine.entity_state(entity_id))
+        if rt is not None:
+            from .engine.gazebo.sdf import DRONE_TYPES
+            T = DRONE_TYPES.get(rt.spec.drone_type, {})
+            detail.template = rt.spec.template
+            detail.type_label = T.get("label", "Quadrotor")
+            detail.control = rt.control_mode
+            detail.sensors = self.engine.sensor_names(entity_id)
+            detail.sensor_mounts = [m.model_dump() for m in rt.spec.sensors] or \
+                                   [m.model_dump() for m in rt.spec.camera_mounts]
+            detail.physical = {"drone_type": rt.spec.drone_type, "mass_kg": T.get("mass"),
+                               "limits": rt.spec.limits.model_dump() if rt.spec.limits else None,
+                               "observation_profile": rt.spec.observation, "armed": rt.armed}
+        elif ent is not None:
+            detail.template = ent.template
+            detail.type_label = {"vehicle": "Ground vehicle", "target": "Target marker", "platform": "Moving platform",
+                                 "beacon": "Rotating beacon"}.get(ent.template, ent.template)
+            tr = ent.trajectory
+            detail.trajectory = {"circle": f"circle r={tr.radius} m @ {tr.speed} m/s", "line": f"line @ {tr.speed} m/s{' (loop)' if tr.loop else ''}",
+                                 "waypoints": f"{len(tr.waypoints)} waypoints @ {tr.speed} m/s", "rotate": f"rotate {tr.yaw_rate} rad/s",
+                                 "static": None}[tr.type]
+            detail.physical = dict(ent.params)
+        else:
+            detail.type_label = {"building": "Building", "obstacle": "Obstacle", "static": "Terrain"}.get(info.kind, info.kind)
+        return detail
+
     async def spawn(self, entity_id: str, template: str, pose: Pose, params: dict,
-                    observation: str | None = None, camera: CameraSpec | None = None) -> None:
+                    observation: str | None = None, camera: CameraSpec | None = None,
+                    drone_type: str = "standard", sensors: list[SensorMount] | None = None,
+                    trajectory=None) -> None:
         if entity_id in self.agents or any(e.entity_id == entity_id for e in self.engine.list_entities()):
             raise ValueError(f"entity {entity_id!r} already exists")
-        is_agent = await self.engine.spawn(entity_id, template, pose, params, camera=camera)
+        sensors = list(sensors or [])
+        is_agent = await self.engine.spawn(entity_id, template, pose, params, camera=camera, drone_type=drone_type,
+                                           mounts=[m for m in sensors if m.type in ("camera", "depth")])
         self._runtime_spawned.add(entity_id)
+        if not is_agent and trajectory is not None:
+            from .scenario import EntitySpec, TrajectorySpec
+            spec_e = EntitySpec(id=entity_id, template=template, spawn=pose, trajectory=TrajectorySpec.model_validate(trajectory), params=params)
+            self._trajectories.entities.append(spec_e)
+            self._runtime_entities[entity_id] = spec_e
         if is_agent:
-            spec = AgentSpec(id=entity_id, template=template, spawn=pose, params=params,
-                             observation=observation or "state", camera=camera)
+            spec = AgentSpec(id=entity_id, template=template, spawn=pose, params=params, drone_type=drone_type,
+                             observation=observation or "state", camera=camera, sensors=sensors)
             comps = resolve_profile(spec.observation, self.scenario.observation_profiles if self.scenario else None)
             self.agents[entity_id] = AgentRuntime(spec, comps)
             self._push_event("agent_spawned", [entity_id], {"template": template})
@@ -355,6 +413,9 @@ class SimulationService:
         was_agent = entity_id in self.agents
         self.agents.pop(entity_id, None)          # before the engine lifts it (no out_of_bounds event)
         self._runtime_spawned.discard(entity_id)
+        if entity_id in self._runtime_entities:
+            self._trajectories.entities = [e for e in self._trajectories.entities if e.id != entity_id]
+            self._runtime_entities.pop(entity_id)
         await self.engine.remove(entity_id)
         if was_agent:
             self._push_event("agent_removed", [entity_id], {})
@@ -387,14 +448,9 @@ class SimulationService:
         if rt is None:
             return None
         spec = rt.spec
-        frames = []
-        if spec.camera:
-            frames.append({"name": "camera", "type": "rgb", "width": spec.camera.width, "height": spec.camera.height,
-                           "hfov": spec.camera.hfov, "rate_hz": spec.camera.update_rate})
-            if spec.camera.depth:
-                frames.append({"name": "depth", "type": "depth", "width": spec.camera.width,
-                               "height": spec.camera.height, "hfov": spec.camera.hfov,
-                               "rate_hz": spec.camera.update_rate})
+        frames = [{"name": m.name, "type": "rgb" if m.type == "camera" else "depth", "width": m.params.get("width", 320),
+                   "height": m.params.get("height", 240), "hfov": m.params.get("hfov", 1.396),
+                   "rate_hz": m.params.get("update_rate", 15), "pose": m.pose} for m in spec.camera_mounts]
         types = ["velocity", "hold", "arm"] + (["waypoint"] if spec.control == "waypoint" else [])
         fields = {
             "velocity": {"vx": "m/s", "vy": "m/s", "vz": "m/s", "yaw_rate": "rad/s", "frame": "body|world"},
@@ -434,15 +490,18 @@ class SimulationService:
             obs.gps = self.engine.gps(agent_id)
         if "nearby_agents" in comps:
             obs.nearby_agents = self._nearby(agent_id, st)
-        for sensor, kind in (("camera", "rgb"), ("depth", "depth")):
-            if sensor in comps and sensor in self.engine.sensor_names(agent_id):
-                fr = self.engine.frame(agent_id, sensor)
-                cam = rt.spec.camera
-                obs.frames.append(SensorFrameRef(
-                    name=sensor, type=kind, width=fr.width if fr else cam.width, height=fr.height if fr else cam.height,
-                    encoding="rgb8" if kind == "rgb" else "depth32f", sim_time=fr.sim_time if fr else None,
-                    seq=fr.seq if fr else 0, url=f"/agents/{agent_id}/sensors/{sensor}",
-                    stream=f"/ws/sensors/{agent_id}/{sensor}"))
+        for m in rt.spec.camera_mounts:
+            comp = "camera" if m.type == "camera" else "depth"
+            if comp not in comps or m.name not in self.engine.sensor_names(agent_id):
+                continue
+            fr = self.engine.frame(agent_id, m.name)
+            kind = "rgb" if m.type == "camera" else "depth"
+            obs.frames.append(SensorFrameRef(
+                name=m.name, type=kind, width=fr.width if fr else m.params.get("width", 320),
+                height=fr.height if fr else m.params.get("height", 240),
+                encoding="rgb8" if kind == "rgb" else "depth32f", sim_time=fr.sim_time if fr else None,
+                seq=fr.seq if fr else 0, url=f"/agents/{agent_id}/sensors/{m.name}",
+                stream=f"/ws/sensors/{agent_id}/{m.name}"))
         return obs
 
     def observations(self) -> dict[str, Observation]:
@@ -501,6 +560,9 @@ class SimulationService:
 
     async def send_action(self, agent_id: str, action: Action) -> None:
         self._apply_action(agent_id, action)
+
+    def _needs_substeps(self) -> bool:
+        return bool(self._trajectories.entities) or any(rt.waypoint is not None for rt in self.agents.values())
 
     def _run_waypoint_controllers(self) -> None:
         """Per-step re-issue of every agent's current command (latching)."""
@@ -655,13 +717,12 @@ class SimulationService:
         recording (replay must not re-log the actions it replays)."""
         dt = self.scenario.simulation.step_size
         t_now = self.engine.status().sim_time
-        chunk = SUBSTEP_ITERS if self._trajectories.entities else n
+        chunk = SUBSTEP_ITERS if self._needs_substeps() else n
         done = 0
         while done < n:
             k = min(chunk, n - done)
             self._place_entities(t_now + (done + k) * dt)
-            if done == 0:
-                self._run_waypoint_controllers()
+            self._run_waypoint_controllers()
             await self.engine.step(k)
             done += k
         if self.episode:
@@ -839,3 +900,45 @@ def _divergence(a: dict[str, dict], b: dict[str, dict]) -> dict[str, Any]:
         per[eid] = {"position": dp, "velocity": dv}
         max_pos, max_vel = max(max_pos, dp), max(max_vel, dv)
     return {"max_position_m": max_pos, "max_velocity_mps": max_vel, "entities": per}
+
+
+def _bbox(model):
+    """Axis-aligned extent of a model's visuals (ignores rotation of visuals; fine for boxes/cylinders)."""
+    from .models import Vec3
+    lo = [float("inf")] * 3; hi = [float("-inf")] * 3
+    found = False
+    for link in model.links:
+        for v in link.visuals:
+            g = v.geometry
+            if g.type == "box" and g.size:
+                half = (g.size.x / 2, g.size.y / 2, g.size.z / 2)
+            elif g.type == "cylinder" and g.radius is not None:
+                half = (g.radius, g.radius, (g.length or 0) / 2)
+            elif g.type == "sphere" and g.radius is not None:
+                half = (g.radius,) * 3
+            elif g.type == "plane" and g.size:
+                half = (g.size.x / 2, g.size.y / 2, 0.0)
+            else:
+                continue
+            c = (link.pose.position.x + v.pose.position.x, link.pose.position.y + v.pose.position.y,
+                 link.pose.position.z + v.pose.position.z)
+            for i in range(3):
+                lo[i] = min(lo[i], c[i] - half[i]); hi[i] = max(hi[i], c[i] + half[i])
+            found = True
+    return Vec3(x=hi[0] - lo[0], y=hi[1] - lo[1], z=hi[2] - lo[2]) if found else None
+
+
+def _category(kind: str, name: str, is_static: bool) -> str:
+    if kind == "drone":
+        return "drone"
+    if kind in ("vehicle", "target"):
+        return kind
+    if kind == "dynamic":
+        return "dynamic"
+    if name == "ground" or kind == "static":
+        return "terrain"
+    if kind == "building":
+        return "building"
+    if any(s in name for s in ("pad", "tower", "mast", "road", "bridge", "platform", "light", "fence")):
+        return "infrastructure"
+    return "obstacle"
