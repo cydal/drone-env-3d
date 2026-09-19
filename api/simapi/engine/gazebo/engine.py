@@ -124,6 +124,8 @@ class GazeboEngine(SimulationEngine):
         self._want_paused = True
         self._last_pose_time = 0.0
         self._derived_iterations = 0
+        self._stats_wall = 0.0            # arrival time of the last stats message
+        self._reset_wall = 0.0            # time of the last observed rewind; older stats are stale
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -252,6 +254,7 @@ class GazeboEngine(SimulationEngine):
                 if it < pre_iter or (pose_t >= 0 and pose_t < pre_t - 1e-6):
                     with self._lock:
                         self._last_pose_time = 0.0    # rewound: restart the pose clock
+                        self._reset_wall = time.monotonic()   # stats older than this are stale
                     return
                 time.sleep(0.005)
             log.warning("reset not observed (iterations still %s), retrying", it)
@@ -301,8 +304,8 @@ class GazeboEngine(SimulationEngine):
             running = self.proc.alive()
             if s is None:
                 return SimStatus(running=running, world=self.world or None)
-            sim_t = _t(s.sim_time)
-            iters = s.iterations
+            sim_t = _t(s.sim_time) if self._stats_fresh() else 0.0
+            iters = s.iterations if self._stats_fresh() else 0
             if self._last_pose_time > sim_t + 1e-9:          # pose clock is ahead of stats
                 dt = self.scenario.simulation.step_size if self.scenario else 0.004
                 sim_t = self._last_pose_time
@@ -314,7 +317,7 @@ class GazeboEngine(SimulationEngine):
 
     def sim_time(self) -> float:
         with self._lock:
-            st = _t(self._stats.sim_time) if self._stats else 0.0
+            st = _t(self._stats.sim_time) if self._stats_fresh() else 0.0
             return max(st, self._last_pose_time)
 
     # ------------------------------------------------------------------ callbacks (transport threads)
@@ -329,7 +332,13 @@ class GazeboEngine(SimulationEngine):
     def _on_stats(self, msg) -> None:
         with self._lock:
             self._stats = msg
+            self._stats_wall = time.monotonic()
         self._stats_event.set()
+
+    def _stats_fresh(self) -> bool:
+        """World stats arrive at 10 Hz; right after a rewind the latest message may still describe
+        the pre-reset world. Caller holds the lock."""
+        return self._stats is not None and self._stats_wall > self._reset_wall
 
     def _on_dynamic_pose(self, msg) -> None:
         with self._lock:

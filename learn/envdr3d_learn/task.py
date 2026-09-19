@@ -202,9 +202,10 @@ class NavigationTask:
                   - r.time_penalty - r.action_penalty * float(np.sum(a * a)))
         clearance = None
         if r.proximity_penalty > 0 and self._obstacles:
-            clearance = min(math.hypot(o[0] - pos[0], o[1] - pos[1]) - o[2] for o in self._obstacles
-                            if o[3] > pos[2] - 0.5)              # only obstacles that reach the drone's altitude
-            reward -= r.proximity_penalty * max(0.0, r.safe_margin - clearance)
+            clearance = min((math.hypot(o[0] - pos[0], o[1] - pos[1]) - o[2] for o in self._obstacles
+                             if o[3] > pos[2] - 0.5), default=None)   # only obstacles reaching the drone's altitude
+            if clearance is not None:
+                reward -= r.proximity_penalty * max(0.0, r.safe_margin - clearance)
         terminated, termination = False, None
         if reached:
             reward += r.reached; terminated, termination = True, "reached"
